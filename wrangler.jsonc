@@ -1,0 +1,66 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ai-trading-warroom-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-17",
+  "observability": { "enabled": true },
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*", "/ws/*"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "warroom-db",
+      "database_id": "REPLACE_WITH_D1_DATABASE_ID",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "queues": {
+    "producers": [
+      { "binding": "MARKET_INGEST", "queue": "warroom-market-ingest" },
+      { "binding": "AGENT_TASKS", "queue": "warroom-agent-tasks" },
+      { "binding": "TRADE_COMMANDS", "queue": "warroom-trade-commands" }
+    ],
+    "consumers": [
+      {
+        "queue": "warroom-market-ingest",
+        "max_batch_size": 50,
+        "max_batch_timeout": 5,
+        "max_retries": 5,
+        "dead_letter_queue": "warroom-market-dlq"
+      },
+      {
+        "queue": "warroom-agent-tasks",
+        "max_batch_size": 10,
+        "max_batch_timeout": 2,
+        "max_retries": 5,
+        "dead_letter_queue": "warroom-agent-dlq"
+      }
+    ]
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "ACCOUNT_COORDINATOR", "class_name": "AccountCoordinator" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["AccountCoordinator"] }
+  ],
+  "r2_buckets": [
+    { "binding": "MARKET_ARCHIVE", "bucket_name": "warroom-market-archive" }
+  ],
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  },
+  "vars": {
+    "APP_ENV": "production",
+    "TRADING_ENABLED": "false",
+    "PAPER_MODE": "true",
+    "MAX_RISK_PER_TRADE_PCT": "0.25",
+    "MAX_DAILY_LOSS_PCT": "2.0",
+    "MAX_DRAWDOWN_PCT": "5.0",
+    "BRIDGE_STALE_SECONDS": "45"
+  }
+}

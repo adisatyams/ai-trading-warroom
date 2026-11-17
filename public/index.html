@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Trading WarRoom</title>
+<style>
+:root{color-scheme:dark;font-family:Inter,system-ui,sans-serif;background:#080d15;color:#e7edf7}
+body{margin:0;padding:24px}.wrap{max-width:1100px;margin:auto}
+header{display:flex;justify-content:space-between;align-items:center;gap:12px}
+h1{font-size:25px;margin:0}.muted{color:#91a1b7}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin:18px 0}
+.card{background:#111b2a;border:1px solid #27364c;border-radius:14px;padding:16px}
+.pill{border-radius:30px;padding:5px 10px;background:#153c32;color:#72e0b2;font-size:12px}
+table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:9px;border-bottom:1px solid #26364a;font-size:13px}
+button{background:#253a55;color:white;border:0;border-radius:8px;padding:9px 13px;margin:3px;cursor:pointer}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;color:#b9c8da}
+</style></head>
+<body><main class="wrap">
+<header><div><h1>AI Trading WarRoom</h1><p class="muted">Cloudflare Control Plane · Phase 1 telemetry only</p></div><span class="pill">EXECUTION LOCKED</span></header>
+<div class="grid">
+<section class="card"><div class="muted">API</div><h2 id="api">Checking…</h2></section>
+<section class="card"><div class="muted">MT5 Bridge</div><h2 id="bridge">Waiting…</h2><small id="bridgeage" class="muted"></small></section>
+<section class="card"><div class="muted">Trading mode</div><h2>Demo / No orders</h2><small class="muted">Executor locked in Phase 1</small></section>
+</div>
+<section class="card"><h2>Agent Registry</h2><table><thead><tr><th>Agent</th><th>Status</th><th>Description</th></tr></thead><tbody id="agents"></tbody></table></section>
+<div class="grid">
+<section class="card"><h2>Latest Market Snapshot</h2><table><thead><tr><th>Symbol</th><th>Bid</th><th>Ask</th><th>Last update</th></tr></thead><tbody id="markets"></tbody></table></section>
+<section class="card"><h2>Control state</h2><p class="muted">Controls affect monitoring state only. They do not enable trading.</p>
+<button onclick="control('pause')">Pause</button><button onclick="control('resume')">Resume</button><button onclick="control('kill')">Kill switch</button><pre id="control">Loading…</pre></section>
+</div>
+<script>
+async function api(path,opts={}){const r=await fetch(path,opts);if(!r.ok)throw Error(path+' '+r.status);return r.json()}
+async function refresh(){
+ try{
+  await api('/health');document.querySelector('#api').textContent='ONLINE';
+  const a=await api('/api/v1/agents');document.querySelector('#agents').innerHTML=a.agents.map(x=>`<tr><td>${x.name}</td><td>${x.status}</td><td>${x.detail||''}</td></tr>`).join('');
+  const b=await api('/api/v1/bridge/status');document.querySelector('#bridge').textContent=b.fresh?'CONNECTED':'OFFLINE / STALE';document.querySelector('#bridgeage').textContent=b.age_seconds===undefined?'No heartbeat':`Last heartbeat ${b.age_seconds}s ago`;
+  const m=await api('/api/v1/market/latest');document.querySelector('#markets').innerHTML=m.items.map(x=>`<tr><td>${x.symbol}</td><td>${x.bid??'-'}</td><td>${x.ask??'-'}</td><td>${x.received_at}</td></tr>`).join('');
+ }catch(e){document.querySelector('#api').textContent='ERROR';console.error(e)}
+}
+async function control(action){
+ const key=prompt('Enter WarRoom API key (admin action):');if(!key)return;
+ const r=await fetch('/api/v1/control/'+action,{method:'POST',headers:{'x-api-key':key}});
+ document.querySelector('#control').textContent=JSON.stringify(await r.json(),null,2);
+}
+refresh();setInterval(refresh,5000);
+</script></main></body></html>
