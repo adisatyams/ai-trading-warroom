@@ -1,3 +1,4 @@
+
 import type { Env, Heartbeat, MarketBatch, Tick } from "./types";
 import { authorized, json } from "./security";
 import { AccountCoordinator } from "./coordinator";
@@ -97,8 +98,8 @@ export default {
           }, 403);
         }
 
-        // equity_snapshots.account_id is NOT NULL in the current D1 schema.
-        // The MT5 account login is used as the account identifier.
+        // equity_snapshots.account_id is NOT NULL.
+        // MT5 account login is used as account identifier.
         if (
           (body.balance !== undefined || body.equity !== undefined) &&
           (
@@ -540,11 +541,29 @@ export default {
         }
 
       } catch (err) {
+        // IMPROVED D1 ERROR LOGGING
+        const errorDetails = err instanceof Error
+          ? {
+              name: err.name,
+              message: err.message,
+              stack: err.stack
+            }
+          : {
+              name: "UnknownError",
+              message: String(err)
+            };
+
         console.error(
-          "market queue batch processing failed",
-          err
+          "MARKET_QUEUE_D1_FAILURE",
+          JSON.stringify({
+            ...errorDetails,
+            batchSize: batch.messages.length,
+            itemCount: items.length,
+            symbols: items.map(item => item.symbol)
+          })
         );
 
+        // Retry failed messages
         for (const message of batch.messages) {
           message.retry();
         }
