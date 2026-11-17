@@ -1,4 +1,3 @@
-
 import type { Env, Heartbeat, MarketBatch, Tick } from "./types";
 import { authorized, json } from "./security";
 import { AccountCoordinator } from "./coordinator";
@@ -98,6 +97,21 @@ export default {
           }, 403);
         }
 
+        // equity_snapshots.account_id is NOT NULL in the current D1 schema.
+        // The MT5 account login is used as the account identifier.
+        if (
+          (body.balance !== undefined || body.equity !== undefined) &&
+          (
+            body.account_login === undefined ||
+            body.account_login === null ||
+            String(body.account_login).trim() === ""
+          )
+        ) {
+          return json({
+            error: "Missing account_login; cannot save equity snapshot"
+          }, 422);
+        }
+
         await env.DB.prepare(`
           INSERT INTO bridge_heartbeats
           (
@@ -131,14 +145,16 @@ export default {
           await env.DB.prepare(`
             INSERT INTO equity_snapshots
             (
+              account_id,
               balance,
               equity,
               floating_pnl,
               currency,
               captured_at
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?)
           `).bind(
+            String(body.account_login),
             body.balance ?? null,
             body.equity ?? null,
             body.equity !== undefined &&
