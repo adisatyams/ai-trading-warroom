@@ -21,8 +21,8 @@ export interface Env {
 export interface Heartbeat {
   terminal_name?: string;
   account_server?: string;
-  account_login?: string;
-  connected: boolean;
+  account_login?: string | number;
+  connected?: boolean;
   balance?: number;
   equity?: number;
   currency?: string;
