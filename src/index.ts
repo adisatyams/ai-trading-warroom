@@ -28,12 +28,23 @@ export default {
         if (denied) return denied;
       }
 
-      if (url.pathname === "/api/v1/agents" && request.method === "GET") {
-        const result = await env.DB.prepare(
-          "SELECT agent_name AS name,status,detail,last_seen_at FROM agent_status ORDER BY agent_name"
-        ).all();
-        return json({ agents: result.results, count: result.results.length, execution_enabled: false });
-      }
+    if (url.pathname === "/api/v1/agents" && request.method === "GET") {
+      const result = await env.DB.prepare(`
+        SELECT
+          agent_id AS name,
+          status,
+          COALESCE(metadata, error_message, strategy_name, '') AS detail,
+          last_heartbeat AS last_seen_at
+        FROM agent_status
+        ORDER BY agent_id
+      ).all();
+    
+      return json({
+        agents: result.results,
+        count: result.results.length,
+        execution_enabled: false
+      });
+    }
 
       if (url.pathname === "/api/v1/bridge/heartbeat" && request.method === "POST") {
         const body = await request.json<Heartbeat>();
