@@ -13,7 +13,7 @@
     {
       "binding": "DB",
       "database_name": "warroom-db",
-      "database_id": "REPLACE_WITH_D1_DATABASE_ID",
+      "database_id": "99108f21-2896-4d9f-a6f9-f8ea0cf0d24f",
       "migrations_dir": "migrations"
     }
   ],
