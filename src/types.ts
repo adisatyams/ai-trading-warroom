@@ -37,3 +37,9 @@ export interface Tick {
   time?: string;
   volume?: number;
 }
+
+export interface MarketBatch {
+  batch_id: string;
+  received_at?: string;
+  ticks: Tick[];
+}

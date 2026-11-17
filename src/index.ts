@@ -1,4 +1,4 @@
-import type { Env, Heartbeat, Tick } from "./types";
+import type { Env, Heartbeat, MarketBatch, Tick } from "./types";
 import { authorized, json } from "./security";
 import { AccountCoordinator } from "./coordinator";
 export { AccountCoordinator };
@@ -37,7 +37,7 @@ export default {
 
       if (url.pathname === "/api/v1/bridge/heartbeat" && request.method === "POST") {
         const body = await request.json<Heartbeat>();
-        if (body.trade_mode === 2) return json({ error: "Live account rejected by Phase 1 bridge policy" }, 403);
+        if (body.trade_mode !== 0) return json({ error: "Only MT5 DEMO accounts are accepted by Phase 1 bridge policy" }, 403);
         await env.DB.prepare(`INSERT INTO bridge_heartbeats
           (terminal_name,account_server,account_login,connected,balance,equity,currency,trade_mode,received_at)
           VALUES(?,?,?,?,?,?,?,?,?)`)
@@ -53,6 +53,33 @@ export default {
         return json({ accepted: true, execution_enabled: false });
       }
 
+      if (url.pathname === "/api/v1/bridge/market-batch" && request.method === "POST") {
+        const contentLength = Number(request.headers.get("content-length") || 0);
+        if (contentLength > 64 * 1024) return json({ error: "Payload too large" }, 413);
+        let body: MarketBatch;
+        try { body = await request.json<MarketBatch>(); }
+        catch { return json({ error: "Invalid JSON" }, 400); }
+        if (!Array.isArray(body.ticks) || body.ticks.length < 1 || body.ticks.length > 10)
+          return json({ error: "ticks must contain 1 to 10 items" }, 422);
+        for (const tick of body.ticks) {
+          if (!tick.symbol || typeof tick.symbol !== "string" || tick.symbol.length > 32)
+            return json({ error: "Invalid symbol" }, 422);
+          if (!Number.isFinite(tick.bid) || !Number.isFinite(tick.ask) || tick.bid! <= 0 || tick.ask! < tick.bid!)
+            return json({ error: `Invalid bid/ask for ${tick.symbol}` }, 422);
+          if (tick.last !== undefined && !Number.isFinite(tick.last))
+            return json({ error: `Invalid last price for ${tick.symbol}` }, 422);
+        }
+        const receivedAt = now();
+        await env.MARKET_INGEST.send({
+          batch_id: body.batch_id || crypto.randomUUID(),
+          received_at: receivedAt,
+          ticks: body.ticks
+        });
+        return json({ accepted: true, queued: true, tick_count: body.ticks.length,
+          execution_enabled: false }, 202);
+      }
+
+      // Backward-compatible single-tick endpoint; the bridge uses market-batch to conserve Queue operations.
       if (url.pathname === "/api/v1/bridge/market-snapshot" && request.method === "POST") {
         const body = await request.json<Tick>();
         if (!body.symbol || body.symbol.length > 32) return json({ error: "Invalid symbol" }, 422);
@@ -115,7 +142,15 @@ export default {
   async queue(batch: MessageBatch<any>, env: Env): Promise<void> {
     if (batch.queue === "warroom-market-ingest") {
       // Archive one batch as one JSONL object instead of creating one R2 object per tick.
-      const items = batch.messages.map(m => m.body as Tick & { received_at?: string });
+      const items: (Tick & { received_at?: string })[] = [];
+      for (const message of batch.messages) {
+        const payload = message.body as (Tick & { received_at?: string }) | MarketBatch;
+        if ("ticks" in payload && Array.isArray(payload.ticks)) {
+          for (const tick of payload.ticks) items.push({ ...tick, received_at: payload.received_at });
+        } else {
+          items.push(payload as Tick & { received_at?: string });
+        }
+      }
       try {
         const received = now();
         const day = received.slice(0, 10);
