@@ -398,10 +398,51 @@ export default {
         if (!query) {
           return json({ error: "Unsupported market_latest schema" }, 503);
         }
-        const rows = await env.DB.prepare(query).all();
+        const rows = await env.DB.prepare(query).all<{
+          symbol: string;
+          bid: number | null;
+          ask: number | null;
+          last: number | null;
+          tick_time: string | null;
+          received_at: string | null;
+        }>();
+        const latestBySymbol = new Map(
+          rows.results.map(row => [row.symbol, row])
+        );
+        const observations = await env.DB.prepare(`
+          SELECT o.symbol, o.bid, o.ask, o.tick_time, o.received_at
+          FROM market_observations o
+          WHERE o.id = (
+            SELECT MAX(newest.id)
+            FROM market_observations newest
+            WHERE newest.symbol = o.symbol
+          )
+          ORDER BY o.symbol
+        `).all<{
+          symbol: string;
+          bid: number;
+          ask: number;
+          tick_time: string | null;
+          received_at: string;
+        }>();
+        for (const observation of observations.results) {
+          const current = latestBySymbol.get(observation.symbol);
+          if (
+            !current ||
+            !current.received_at ||
+            observation.received_at >= current.received_at
+          ) {
+            latestBySymbol.set(observation.symbol, {
+              ...observation,
+              last: null
+            });
+          }
+        }
 
         return json({
-          items: rows.results
+          items: [...latestBySymbol.values()].sort((a, b) =>
+            a.symbol.localeCompare(b.symbol)
+          )
         });
       }
 
