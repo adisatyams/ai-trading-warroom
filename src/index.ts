@@ -2,6 +2,13 @@
 import type { Env, Heartbeat, MarketBatch, Tick } from "./types";
 import { authorized, json } from "./security";
 import { AccountCoordinator } from "./coordinator";
+import {
+  SCANNER_STATES,
+  latestResults,
+  pruneScanner,
+  recordAndScan,
+  scannerStatus
+} from "./scanner_store";
 
 export { AccountCoordinator };
 
@@ -52,6 +59,55 @@ export default {
       if (request.method === "POST") {
         const denied = await requireAuth(request, env);
         if (denied) return denied;
+      }
+
+      // =====================================================
+      // DETERMINISTIC SCANNER (research candidates only)
+      // Unlike other GET routes these require x-api-key: they expose
+      // internal analysis and must not be public.
+      // =====================================================
+      if (
+        url.pathname === "/api/v1/scanner/status" &&
+        request.method === "GET"
+      ) {
+        const denied = await requireAuth(request, env);
+        if (denied) return denied;
+
+        return json(await scannerStatus(env));
+      }
+
+      if (
+        url.pathname === "/api/v1/scanner/latest" &&
+        request.method === "GET"
+      ) {
+        const denied = await requireAuth(request, env);
+        if (denied) return denied;
+
+        const symbol = url.searchParams.get("symbol") || undefined;
+        if (symbol && !/^[A-Za-z0-9._-]{1,32}$/.test(symbol)) {
+          return json({ error: "Invalid symbol" }, 422);
+        }
+
+        const stateParam = url.searchParams.get("state");
+        const states = stateParam
+          ? stateParam.toUpperCase().split(",").map(s => s.trim())
+          : undefined;
+        if (
+          states &&
+          !states.every(s => (SCANNER_STATES as readonly string[]).includes(s))
+        ) {
+          return json({
+            error: `state must be one of ${SCANNER_STATES.join(",")}`
+          }, 422);
+        }
+
+        const items = await latestResults(env, { symbol, states });
+        return json({
+          items,
+          count: items.length,
+          advisory_only: true,
+          execution_enabled: false
+        });
       }
 
       // =====================================================
@@ -540,6 +596,36 @@ export default {
           message.ack();
         }
 
+        // Scanner runs AFTER ingestion is committed and acked. It is derived
+        // data, so a scanner failure must never cause market ingestion to be
+        // retried; it is logged and recomputed from the next batch.
+        try {
+          const scan = await recordAndScan(env, items, received);
+          console.log(JSON.stringify({
+            event: "scanner_run",
+            ...scan
+          }));
+        } catch (scanErr) {
+          const message =
+            scanErr instanceof Error ? scanErr.message : String(scanErr);
+          console.error("SCANNER_FAILURE", message);
+          try {
+            await env.DB.prepare(`
+              INSERT INTO system_events
+              (level, event_type, message, payload_json, created_at)
+              VALUES (?, ?, ?, ?, ?)
+            `).bind(
+              "ERROR",
+              "SCANNER_FAILURE",
+              "Deterministic scanner failed",
+              JSON.stringify({ error: message }),
+              now()
+            ).run();
+          } catch {
+            // logging must never throw out of the queue handler
+          }
+        }
+
       } catch (err) {
         // IMPROVED D1 ERROR LOGGING
         const errorDetails = err instanceof Error
@@ -661,6 +747,16 @@ export default {
           "Windows MT5 bridge heartbeat is stale",
           now()
         ).run();
+      }
+
+      // Retention for scanner history (observations 48h, results 14d).
+      try {
+        await pruneScanner(env);
+      } catch (err) {
+        console.error(
+          "SCANNER_PRUNE_FAILURE",
+          err instanceof Error ? err.message : String(err)
+        );
       }
 
       console.log(JSON.stringify({
