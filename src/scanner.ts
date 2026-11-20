@@ -138,6 +138,22 @@ function clamp01(x: number): number {
   return Math.min(1, Math.max(0, x));
 }
 
+function maxSpreadForSymbol(
+  symbol: string,
+  config: ScannerConfig
+): number {
+  const exact = config.maxSpreadBpsBySymbol[symbol];
+  if (exact !== undefined) return exact;
+
+  const normalized = symbol.toUpperCase();
+  const prefix = Object.keys(config.maxSpreadBpsBySymbol).find(key =>
+    normalized.startsWith(key.toUpperCase())
+  );
+  return prefix
+    ? config.maxSpreadBpsBySymbol[prefix]
+    : config.defaultMaxSpreadBps;
+}
+
 /** Deterministic id: the same symbol + newest observation always yields the same id. */
 export function signalId(symbol: string, asOf: string | null): string {
   return `${STRATEGY}:${symbol}:${asOf ?? "none"}`;
@@ -303,8 +319,7 @@ export function evaluate(
   // 4. Spread guard on the newest quote.
   const mid = midPrice(latest);
   const spread = spreadBps(latest);
-  const maxSpread =
-    config.maxSpreadBpsBySymbol[symbol] ?? config.defaultMaxSpreadBps;
+  const maxSpread = maxSpreadForSymbol(symbol, config);
   features.mid = round(mid, 8);
   features.spread_bps = round(spread, 3);
   features.max_spread_bps = maxSpread;

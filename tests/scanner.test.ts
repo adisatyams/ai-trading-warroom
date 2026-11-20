@@ -144,20 +144,21 @@ test("REJECTED SPREAD_TOO_WIDE uses per-symbol limit", () => {
   assert.equal(r.state, "REJECTED");
   assert.equal(r.reject_reason, "SPREAD_TOO_WIDE");
 
-  // Same relative spread passes for XAUUSD (limit 8 bps -> still too wide at 9), use 5 bps.
+  // Broker-suffixed XAUUSDm keeps the configured 8 bps ceiling.
   const gold = Array.from({ length: 25 }, (_, i) => {
     const mid = 2600 + i * 0.5;
     const t = new Date(T0 + i * STEP).toISOString();
     return {
-      symbol: "XAUUSD",
+      symbol: "XAUUSDm",
       bid: mid - 0.065,
-      ask: mid + 0.065, // 0.13 / 2612 ≈ 0.5 bps
+      ask: mid + 0.065,
       received_at: t,
       tick_time: t
     };
   });
-  r = evaluate("XAUUSD", gold, nowAfter(gold));
+  r = evaluate("XAUUSDm", gold, nowAfter(gold));
   assert.notEqual(r.reject_reason, "SPREAD_TOO_WIDE");
+  assert.equal(r.features.max_spread_bps, 8);
 });
 
 test("REJECTED OUT_OF_ORDER for non-monotonic received_at", () => {
