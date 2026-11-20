@@ -67,3 +67,29 @@ export interface PositionSnapshotPayload {
     volume: number;
   }>;
 }
+
+export interface M1Candle {
+  time: string;
+  high: number;
+  low: number;
+  close: number;
+}
+
+export interface SizingInputSymbol {
+  symbol: string;
+  available: boolean;
+  error?: string | null;
+  candles: M1Candle[];
+  spec: {
+    tick_size: number;
+    tick_value_loss: number;
+    volume_min: number;
+    volume_max: number;
+    volume_step: number;
+  } | null;
+}
+
+export interface SizingInputsPayload {
+  captured_at: string;
+  symbols: SizingInputSymbol[];
+}

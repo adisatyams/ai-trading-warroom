@@ -5,6 +5,7 @@ import type {
   MarketBatch,
   NewsCalendarPayload,
   PositionSnapshotPayload,
+  SizingInputsPayload,
   Tick
 } from "./types";
 import { authorized, json } from "./security";
@@ -31,6 +32,13 @@ import {
   saveNewsCalendar,
   savePositionSnapshot
 } from "./risk_store";
+import {
+  latestPositionSizes,
+  positionSizerStatus,
+  prunePositionSizingData,
+  saveSizingInputs,
+  sizeEligibleSignals
+} from "./position_sizer_store";
 
 export { AccountCoordinator };
 
@@ -164,6 +172,46 @@ export default {
           }, 422);
         }
         const items = await latestRiskResults(env, { symbol, decision });
+        return json({
+          items,
+          count: items.length,
+          advisory_only: true,
+          execution_enabled: false
+        });
+      }
+
+      // =====================================================
+      // POSITION SIZER (paper-review calculation only)
+      // =====================================================
+      if (
+        url.pathname === "/api/v1/sizer/status" &&
+        request.method === "GET"
+      ) {
+        const denied = await requireAuth(request, env);
+        if (denied) return denied;
+        return json(await positionSizerStatus(env));
+      }
+
+      if (
+        url.pathname === "/api/v1/sizer/latest" &&
+        request.method === "GET"
+      ) {
+        const denied = await requireAuth(request, env);
+        if (denied) return denied;
+        const symbol = url.searchParams.get("symbol") || undefined;
+        if (symbol && !/^[A-Za-z0-9._-]{1,32}$/.test(symbol)) {
+          return json({ error: "Invalid symbol" }, 422);
+        }
+        const decision = url.searchParams.get("decision") || undefined;
+        if (
+          decision &&
+          !["SIZED_FOR_PAPER_REVIEW", "REJECTED"].includes(decision)
+        ) {
+          return json({
+            error: "decision must be SIZED_FOR_PAPER_REVIEW or REJECTED"
+          }, 422);
+        }
+        const items = await latestPositionSizes(env, { symbol, decision });
         return json({
           items,
           count: items.length,
@@ -404,6 +452,119 @@ export default {
           }
         }
         const result = await savePositionSnapshot(env, body);
+        return json({
+          accepted: true,
+          ...result,
+          execution_enabled: false
+        });
+      }
+
+      // =====================================================
+      // MT5 M1 ATR AND CONTRACT-SPEC SNAPSHOT
+      // =====================================================
+      if (
+        url.pathname === "/api/v1/bridge/sizing-inputs" &&
+        request.method === "POST"
+      ) {
+        const contentLength = Number(
+          request.headers.get("content-length") || 0
+        );
+        if (contentLength > 256 * 1024) {
+          return json({ error: "Payload too large" }, 413);
+        }
+        let body: SizingInputsPayload;
+        try {
+          body = await request.json<SizingInputsPayload>();
+        } catch {
+          return json({ error: "Invalid JSON" }, 400);
+        }
+        if (
+          !body ||
+          typeof body !== "object" ||
+          typeof body.captured_at !== "string" ||
+          !Number.isFinite(Date.parse(body.captured_at)) ||
+          !Array.isArray(body.symbols) ||
+          body.symbols.length < 1 ||
+          body.symbols.length > 10
+        ) {
+          return json({ error: "Invalid position-sizing snapshot" }, 422);
+        }
+
+        const seenSymbols = new Set<string>();
+        for (const item of body.symbols) {
+          if (
+            !item ||
+            typeof item !== "object" ||
+            typeof item.symbol !== "string" ||
+            !/^[A-Za-z0-9._-]{1,32}$/.test(item.symbol) ||
+            seenSymbols.has(item.symbol.toUpperCase()) ||
+            typeof item.available !== "boolean"
+          ) {
+            return json({ error: "Invalid sizing symbol entry" }, 422);
+          }
+          seenSymbols.add(item.symbol.toUpperCase());
+          if (item.error != null && (
+            typeof item.error !== "string" ||
+            item.error.length > 200
+          )) {
+            return json({ error: "Invalid sizing-input error detail" }, 422);
+          }
+          if (!Array.isArray(item.candles)) {
+            return json({ error: "Sizing candles must be an array" }, 422);
+          }
+          if (!item.available) {
+            if (
+              item.candles.length !== 0 ||
+              item.spec !== null
+            ) {
+              return json({
+                error: "Unavailable symbols must not include sizing data"
+              }, 422);
+            }
+            continue;
+          }
+          if (
+            !Array.isArray(item.candles) ||
+            item.candles.length !== 29 ||
+            !item.spec ||
+            typeof item.spec !== "object"
+          ) {
+            return json({
+              error: "Available symbols require 29 M1 candles and a symbol spec"
+            }, 422);
+          }
+          for (const candle of item.candles) {
+            if (
+              !candle ||
+              typeof candle.time !== "string" ||
+              !Number.isFinite(Date.parse(candle.time)) ||
+              !Number.isFinite(candle.high) ||
+              !Number.isFinite(candle.low) ||
+              !Number.isFinite(candle.close) ||
+              candle.low <= 0 ||
+              candle.high < candle.low ||
+              candle.close < candle.low ||
+              candle.close > candle.high
+            ) {
+              return json({ error: "Invalid M1 candle" }, 422);
+            }
+          }
+          const specValues = [
+            item.spec.tick_size,
+            item.spec.tick_value_loss,
+            item.spec.volume_min,
+            item.spec.volume_max,
+            item.spec.volume_step
+          ];
+          if (
+            !specValues.every(value => Number.isFinite(value) && value > 0) ||
+            item.spec.volume_max < item.spec.volume_min
+          ) {
+            return json({ error: "Invalid MT5 symbol contract spec" }, 422);
+          }
+        }
+
+        const result = await saveSizingInputs(env, body);
         return json({
           accepted: true,
           ...result,
@@ -859,6 +1020,18 @@ export default {
               event: "risk_checker_run",
               ...risk
             }));
+            try {
+              const sizing = await sizeEligibleSignals(env, scan.symbols);
+              console.log(JSON.stringify({
+                event: "position_sizer_run",
+                ...sizing
+              }));
+            } catch (sizerErr) {
+              console.error(
+                "POSITION_SIZER_FAILURE",
+                sizerErr instanceof Error ? sizerErr.message : String(sizerErr)
+              );
+            }
           } catch (riskErr) {
             console.error(
               "RISK_CHECKER_FAILURE",
@@ -1000,6 +1173,14 @@ export default {
       } catch (err) {
         console.error(
           "RISK_RETENTION_FAILURE",
+          err instanceof Error ? err.message : String(err)
+        );
+      }
+      try {
+        await prunePositionSizingData(env);
+      } catch (err) {
+        console.error(
+          "POSITION_SIZER_RETENTION_FAILURE",
           err instanceof Error ? err.message : String(err)
         );
       }

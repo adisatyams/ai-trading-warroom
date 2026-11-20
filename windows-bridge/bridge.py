@@ -15,7 +15,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 BASE = os.environ["WARROOM_API_URL"].rstrip("/")
 KEY = os.environ["WARROOM_API_KEY"]
 PATH = os.getenv("MT5_PATH", "")
-SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "EURUSD,GBPUSD,XAUUSD").split(",") if s.strip()]
+DEFAULT_SYMBOLS = "XAUUSDm,EURUSDm,GBPUSDm,USDJPYm,AUDUSDm,USDCADm,BTCUSDm,ETHUSDm"
+SYMBOLS = [
+    symbol.strip()
+    for symbol in os.getenv("SYMBOLS", DEFAULT_SYMBOLS).split(",")
+    if symbol.strip()
+]
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "5"))
 HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "60"))
 MARKET_BATCH_SECONDS = int(os.getenv("MARKET_BATCH_SECONDS", "60"))
@@ -133,6 +138,70 @@ def send_position_snapshot(client: httpx.Client):
     logging.info("Position snapshot accepted: %d positions", len(items))
 
 
+def send_sizing_inputs(client: httpx.Client):
+    captured_at = datetime.now(timezone.utc).isoformat()
+    items = []
+    for symbol in SYMBOLS:
+        info = mt5.symbol_info(symbol)
+        rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 1, 29)
+        if info is None or rates is None or len(rates) < 29:
+            items.append({
+                "symbol": symbol,
+                "available": False,
+                "error": "MT5 symbol info or 29 completed M1 candles unavailable",
+                "candles": [],
+                "spec": None,
+            })
+            continue
+
+        ordered_rates = sorted(rates, key=lambda rate: int(rate["time"]))[-29:]
+        candles = [{
+            "time": datetime.fromtimestamp(
+                int(rate["time"]), timezone.utc
+            ).isoformat(),
+            "high": float(rate["high"]),
+            "low": float(rate["low"]),
+            "close": float(rate["close"]),
+        } for rate in ordered_rates]
+        spec = {
+            "tick_size": float(info.trade_tick_size),
+            "tick_value_loss": float(info.trade_tick_value_loss),
+            "volume_min": float(info.volume_min),
+            "volume_max": float(info.volume_max),
+            "volume_step": float(info.volume_step),
+        }
+        if any(value <= 0 for value in spec.values()):
+            items.append({
+                "symbol": symbol,
+                "available": False,
+                "error": "MT5 tick-value or volume constraints unavailable",
+                "candles": [],
+                "spec": None,
+            })
+            continue
+
+        items.append({
+            "symbol": symbol,
+            "available": True,
+            "error": None,
+            "candles": candles,
+            "spec": spec,
+        })
+
+    response = client.post(
+        BASE + "/api/v1/bridge/sizing-inputs",
+        headers=HEADERS,
+        json={"captured_at": captured_at, "symbols": items},
+    )
+    response.raise_for_status()
+    available = sum(1 for item in items if item["available"])
+    logging.info(
+        "Position sizing inputs accepted: %d/%d symbols available",
+        available,
+        len(items),
+    )
+
+
 def main():
     acc = connect()
     logging.info("Connected to DEMO server %s", acc.server)
@@ -162,6 +231,7 @@ def main():
                 if now_mono - last_risk_snapshot >= RISK_SNAPSHOT_SECONDS:
                     send_calendar_snapshot(client)
                     send_position_snapshot(client)
+                    send_sizing_inputs(client)
                     last_risk_snapshot = now_mono
 
             except Exception:
