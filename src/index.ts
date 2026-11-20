@@ -119,17 +119,12 @@ export default {
       ) {
         const result = await env.DB.prepare(`
           SELECT
-            agent_id AS name,
+            agent_name AS name,
             status,
-            COALESCE(
-              metadata,
-              error_message,
-              strategy_name,
-              ''
-            ) AS detail,
-            last_heartbeat AS last_seen_at
+            COALESCE(detail, '') AS detail,
+            last_seen_at
           FROM agent_status
-          ORDER BY agent_id
+          ORDER BY agent_name
         `).all();
 
         return json({
@@ -146,7 +141,13 @@ export default {
         url.pathname === "/api/v1/bridge/heartbeat" &&
         request.method === "POST"
       ) {
-        const body = await request.json<Heartbeat>();
+        let body: Heartbeat;
+
+        try {
+          body = await request.json<Heartbeat>();
+        } catch {
+          return json({ error: "Invalid JSON" }, 400);
+        }
 
         if (body.trade_mode !== 0) {
           return json({
@@ -154,19 +155,14 @@ export default {
           }, 403);
         }
 
-        // equity_snapshots.account_id is NOT NULL.
-        // MT5 account login is used as account identifier.
-        if (
-          (body.balance !== undefined || body.equity !== undefined) &&
-          (
-            body.account_login === undefined ||
-            body.account_login === null ||
-            String(body.account_login).trim() === ""
-          )
-        ) {
-          return json({
-            error: "Missing account_login; cannot save equity snapshot"
-          }, 422);
+        // The bridge intentionally does not transmit the MT5 account login,
+        // and equity_snapshots has no account column, so account_login is
+        // optional (stored in bridge_heartbeats only if a bridge sends it).
+        for (const field of ["balance", "equity"] as const) {
+          const v = body[field];
+          if (v !== undefined && !Number.isFinite(v)) {
+            return json({ error: `Invalid ${field}` }, 422);
+          }
         }
 
         await env.DB.prepare(`
@@ -202,16 +198,14 @@ export default {
           await env.DB.prepare(`
             INSERT INTO equity_snapshots
             (
-              account_id,
               balance,
               equity,
               floating_pnl,
               currency,
               captured_at
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?)
           `).bind(
-            String(body.account_login),
             body.balance ?? null,
             body.equity ?? null,
             body.equity !== undefined &&
@@ -350,8 +344,11 @@ export default {
         url.pathname === "/api/v1/bridge/status" &&
         request.method === "GET"
       ) {
+        // This route is unauthenticated (the dashboard polls it), so it
+        // returns liveness only. Account login, server, balance and equity
+        // stay in D1 and are intentionally not exposed here.
         const row = await env.DB.prepare(`
-          SELECT *
+          SELECT terminal_name, connected, trade_mode, received_at
           FROM bridge_heartbeats
           ORDER BY id DESC
           LIMIT 1
@@ -368,8 +365,10 @@ export default {
           (Date.now() - Date.parse(row.received_at)) / 1000;
 
         return json({
-          ...row,
+          terminal_name: row.terminal_name,
           connected: !!row.connected,
+          demo: row.trade_mode === 0,
+          received_at: row.received_at,
           age_seconds: Math.round(age),
           fresh: age <= Number(env.BRIDGE_STALE_SECONDS || 45)
         });

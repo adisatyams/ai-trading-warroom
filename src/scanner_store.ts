@@ -136,11 +136,25 @@ export async function recordAndScan(
     );
   }
 
-  if (resultStatements.length) await env.DB.batch(resultStatements);
+  if (resultStatements.length) {
+    // Keep the dashboard's Agent Registry truthful about the scanner.
+    // No-op if the SCANNER row does not exist.
+    resultStatements.push(
+      env.DB.prepare(`
+        UPDATE agent_status
+        SET status = 'READY', last_seen_at = ?, detail = ?
+        WHERE agent_name = 'SCANNER'
+      `).bind(
+        new Date().toISOString(),
+        `${STRATEGY} v${STRATEGY_VERSION}: research candidates only, no order path`
+      )
+    );
+    await env.DB.batch(resultStatements);
+  }
 
   return {
     observations,
-    evaluated: resultStatements.length,
+    evaluated: symbols.size,
     rejected_ticks: rejectedTicks
   };
 }

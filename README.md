@@ -14,4 +14,8 @@ Windows VPS:
 - Exness MT5 Demo
 - Python telemetry bridge
 
+Deterministic scanner (`SNAPSHOT_MOMENTUM_V1`): rule-based candidate generation after market ingestion, results stored for audit and exposed at `/api/v1/scanner/*` (API key required). Research only.
+
+Development: `npm run typecheck` and `npm test`.
+
 Trading execution is intentionally disabled. This package does not send broker orders.
