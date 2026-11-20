@@ -92,11 +92,3 @@ CREATE TABLE IF NOT EXISTS equity_snapshots (
   currency TEXT,
   captured_at TEXT NOT NULL
 );
-
-INSERT OR IGNORE INTO agent_status(agent_name,status,detail) VALUES
-('SCANNER','READY','Phase 1 telemetry; strategy engine not enabled'),
-('RISK_CHECK','READY','Policy scaffold; fail-closed'),
-('SIZER','LOCKED','Awaiting verified broker symbol contract metadata'),
-('EXECUTOR','LOCKED','No order execution in Phase 1'),
-('LOGGER','READY','System and market event logging'),
-('EQUITY','READY','Account telemetry monitoring');

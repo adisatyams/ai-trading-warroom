@@ -1,7 +1,21 @@
 
-import type { Env, Heartbeat, MarketBatch, Tick } from "./types";
+import type {
+  Env,
+  Heartbeat,
+  MarketBatch,
+  NewsCalendarPayload,
+  PositionSnapshotPayload,
+  Tick
+} from "./types";
 import { authorized, json } from "./security";
 import { AccountCoordinator } from "./coordinator";
+import {
+  agentStatusSelect,
+  insertSystemEvent,
+  marketLatestSelect,
+  marketLatestUpsert,
+  tableColumns
+} from "./db_compat";
 import {
   SCANNER_STATES,
   latestResults,
@@ -9,6 +23,14 @@ import {
   recordAndScan,
   scannerStatus
 } from "./scanner_store";
+import {
+  checkLatestSignals,
+  latestRiskResults,
+  pruneRiskData,
+  riskStatus,
+  saveNewsCalendar,
+  savePositionSnapshot
+} from "./risk_store";
 
 export { AccountCoordinator };
 
@@ -111,21 +133,59 @@ export default {
       }
 
       // =====================================================
+      // DETERMINISTIC RISK CHECKER (paper-review gate only)
+      // =====================================================
+      if (
+        url.pathname === "/api/v1/risk/status" &&
+        request.method === "GET"
+      ) {
+        const denied = await requireAuth(request, env);
+        if (denied) return denied;
+        return json(await riskStatus(env));
+      }
+
+      if (
+        url.pathname === "/api/v1/risk/latest" &&
+        request.method === "GET"
+      ) {
+        const denied = await requireAuth(request, env);
+        if (denied) return denied;
+        const symbol = url.searchParams.get("symbol") || undefined;
+        if (symbol && !/^[A-Za-z0-9._-]{1,32}$/.test(symbol)) {
+          return json({ error: "Invalid symbol" }, 422);
+        }
+        const decision = url.searchParams.get("decision") || undefined;
+        if (
+          decision &&
+          !["ELIGIBLE_FOR_PAPER_REVIEW", "REJECTED"].includes(decision)
+        ) {
+          return json({
+            error: "decision must be ELIGIBLE_FOR_PAPER_REVIEW or REJECTED"
+          }, 422);
+        }
+        const items = await latestRiskResults(env, { symbol, decision });
+        return json({
+          items,
+          count: items.length,
+          advisory_only: true,
+          execution_enabled: false
+        });
+      }
+
+      // =====================================================
       // AGENTS API
       // =====================================================
       if (
         url.pathname === "/api/v1/agents" &&
         request.method === "GET"
       ) {
-        const result = await env.DB.prepare(`
-          SELECT
-            agent_name AS name,
-            status,
-            COALESCE(detail, '') AS detail,
-            last_seen_at
-          FROM agent_status
-          ORDER BY agent_name
-        `).all();
+        const query = agentStatusSelect(
+          await tableColumns(env.DB, "agent_status")
+        );
+        if (!query) {
+          return json({ error: "Unsupported agent_status schema" }, 503);
+        }
+        const result = await env.DB.prepare(query).all();
 
         return json({
           agents: result.results,
@@ -195,30 +255,158 @@ export default {
           body.balance !== undefined ||
           body.equity !== undefined
         ) {
-          await env.DB.prepare(`
-            INSERT INTO equity_snapshots
-            (
-              balance,
-              equity,
-              floating_pnl,
-              currency,
-              captured_at
-            )
-            VALUES (?, ?, ?, ?, ?)
-          `).bind(
-            body.balance ?? null,
-            body.equity ?? null,
-            body.equity !== undefined &&
-            body.balance !== undefined
-              ? body.equity - body.balance
-              : null,
-            body.currency ?? null,
-            now()
-          ).run();
+          const equityColumns = await tableColumns(env.DB, "equity_snapshots");
+          // Legacy databases require an account_id, which the telemetry-only
+          // bridge deliberately does not send. The values remain available in
+          // bridge_heartbeats until the account schema is reconciled.
+          if (!equityColumns.has("account_id")) {
+            await env.DB.prepare(`
+              INSERT INTO equity_snapshots
+              (
+                balance,
+                equity,
+                floating_pnl,
+                currency,
+                captured_at
+              )
+              VALUES (?, ?, ?, ?, ?)
+            `).bind(
+              body.balance ?? null,
+              body.equity ?? null,
+              body.equity !== undefined &&
+              body.balance !== undefined
+                ? body.equity - body.balance
+                : null,
+              body.currency ?? null,
+              now()
+            ).run();
+          }
         }
 
         return json({
           accepted: true,
+          execution_enabled: false
+        });
+      }
+
+      // =====================================================
+      // MT5 ECONOMIC CALENDAR SNAPSHOT
+      // =====================================================
+      if (
+        url.pathname === "/api/v1/bridge/news-calendar" &&
+        request.method === "POST"
+      ) {
+        const contentLength = Number(
+          request.headers.get("content-length") || 0
+        );
+        if (contentLength > 128 * 1024) {
+          return json({ error: "Payload too large" }, 413);
+        }
+
+        let body: NewsCalendarPayload;
+        try {
+          body = await request.json<NewsCalendarPayload>();
+        } catch {
+          return json({ error: "Invalid JSON" }, 400);
+        }
+
+        if (
+          !body ||
+          typeof body !== "object" ||
+          (body.error !== undefined &&
+            body.error !== null &&
+            typeof body.error !== "string") ||
+          (typeof body.error === "string" && body.error.length > 250) ||
+          typeof body.available !== "boolean" ||
+          typeof body.generated_at !== "string" ||
+          !Number.isFinite(Date.parse(body.generated_at)) ||
+          !Array.isArray(body.events) ||
+          body.events.length > 500
+        ) {
+          return json({ error: "Invalid calendar snapshot" }, 422);
+        }
+        if (!body.available && body.events.length) {
+          return json({
+            error: "Unavailable calendar snapshots must not include events"
+          }, 422);
+        }
+
+        for (const event of body.events) {
+          if (
+            !event ||
+            typeof event !== "object" ||
+            typeof event.event_id !== "string" ||
+            !event.event_id ||
+            event.event_id.length > 64 ||
+            typeof event.name !== "string" ||
+            !event.name ||
+            event.name.length > 200 ||
+            typeof event.currency !== "string" ||
+            !/^[A-Z]{3}$/.test(event.currency) ||
+            event.importance !== "HIGH" ||
+            typeof event.scheduled_at !== "string" ||
+            !Number.isFinite(Date.parse(event.scheduled_at))
+          ) {
+            return json({ error: "Invalid high-impact calendar event" }, 422);
+          }
+        }
+
+        const result = await saveNewsCalendar(env, body);
+        return json({
+          accepted: true,
+          ...result,
+          execution_enabled: false
+        });
+      }
+
+      // =====================================================
+      // MT5 OPEN POSITION SNAPSHOT (read-only telemetry)
+      // =====================================================
+      if (
+        url.pathname === "/api/v1/bridge/positions" &&
+        request.method === "POST"
+      ) {
+        const contentLength = Number(
+          request.headers.get("content-length") || 0
+        );
+        if (contentLength > 64 * 1024) {
+          return json({ error: "Payload too large" }, 413);
+        }
+        let body: PositionSnapshotPayload;
+        try {
+          body = await request.json<PositionSnapshotPayload>();
+        } catch {
+          return json({ error: "Invalid JSON" }, 400);
+        }
+        if (
+          !body ||
+          typeof body !== "object" ||
+          typeof body.captured_at !== "string" ||
+          !Number.isFinite(Date.parse(body.captured_at)) ||
+          !Array.isArray(body.positions) ||
+          body.positions.length > 100
+        ) {
+          return json({ error: "Invalid position snapshot" }, 422);
+        }
+        for (const position of body.positions) {
+          if (
+            !position ||
+            typeof position !== "object" ||
+            typeof position.symbol !== "string" ||
+            !position.symbol ||
+            position.symbol.length > 32 ||
+            typeof position.direction !== "string" ||
+            !["BUY", "SELL"].includes(position.direction) ||
+            !Number.isFinite(position.volume) ||
+            position.volume <= 0
+          ) {
+            return json({ error: "Invalid open position" }, 422);
+          }
+        }
+        const result = await savePositionSnapshot(env, body);
+        return json({
+          accepted: true,
+          ...result,
           execution_enabled: false
         });
       }
@@ -367,7 +555,7 @@ export default {
         return json({
           terminal_name: row.terminal_name,
           connected: !!row.connected,
-          demo: row.trade_mode === 0,
+          demo: Number(row.trade_mode) === 0,
           received_at: row.received_at,
           age_seconds: Math.round(age),
           fresh: age <= Number(env.BRIDGE_STALE_SECONDS || 45)
@@ -381,14 +569,57 @@ export default {
         url.pathname === "/api/v1/market/latest" &&
         request.method === "GET"
       ) {
-        const rows = await env.DB.prepare(`
-          SELECT *
-          FROM market_latest
-          ORDER BY symbol
-        `).all();
+        const query = marketLatestSelect(
+          await tableColumns(env.DB, "market_latest")
+        );
+        if (!query) {
+          return json({ error: "Unsupported market_latest schema" }, 503);
+        }
+        const rows = await env.DB.prepare(query).all<{
+          symbol: string;
+          bid: number | null;
+          ask: number | null;
+          last: number | null;
+          tick_time: string | null;
+          received_at: string | null;
+        }>();
+        const latestBySymbol = new Map(
+          rows.results.map(row => [row.symbol, row])
+        );
+        const observations = await env.DB.prepare(`
+          SELECT o.symbol, o.bid, o.ask, o.tick_time, o.received_at
+          FROM market_observations o
+          WHERE o.id = (
+            SELECT MAX(newest.id)
+            FROM market_observations newest
+            WHERE newest.symbol = o.symbol
+          )
+          ORDER BY o.symbol
+        `).all<{
+          symbol: string;
+          bid: number;
+          ask: number;
+          tick_time: string | null;
+          received_at: string;
+        }>();
+        for (const observation of observations.results) {
+          const current = latestBySymbol.get(observation.symbol);
+          if (
+            !current ||
+            !current.received_at ||
+            observation.received_at >= current.received_at
+          ) {
+            latestBySymbol.set(observation.symbol, {
+              ...observation,
+              last: null
+            });
+          }
+        }
 
         return json({
-          items: rows.results
+          items: [...latestBySymbol.values()].sort((a, b) =>
+            a.symbol.localeCompare(b.symbol)
+          )
         });
       }
 
@@ -553,38 +784,56 @@ export default {
           }
         });
 
-        const statements = items.map(item => {
+        const marketColumns = await tableColumns(env.DB, "market_latest");
+        const marketUpsert = marketLatestUpsert(marketColumns);
+        if (!marketUpsert) {
+          throw new Error("Unsupported market_latest schema");
+        }
+        const instrumentColumns = marketUpsert.legacy
+          ? await tableColumns(env.DB, "instruments")
+          : new Set<string>();
+        const knownSymbols = new Set<string>();
+        if (marketUpsert.legacy && instrumentColumns.has("symbol")) {
+          const known = await env.DB.prepare(
+            "SELECT symbol FROM instruments"
+          ).all<{ symbol: string }>();
+          for (const row of known.results) knownSymbols.add(row.symbol);
+        }
+
+        const statements = items.flatMap(item => {
           const itemReceived =
             item.received_at || received;
 
-          return env.DB.prepare(`
-            INSERT INTO market_latest
-            (
-              symbol,
-              bid,
-              ask,
+          if (
+            marketUpsert.legacy &&
+            (!knownSymbols.has(item.symbol) ||
+              !Number.isFinite(item.bid) ||
+              !Number.isFinite(item.ask) ||
+              item.bid! <= 0 ||
+              item.ask! < item.bid!)
+          ) {
+            return [];
+          }
+
+          if (marketUpsert.legacy) {
+            const last = item.last ?? (item.bid! + item.ask!) / 2;
+            return [env.DB.prepare(marketUpsert.sql).bind(
+              item.symbol,
+              item.bid,
+              item.ask,
               last,
-              tick_time,
-              received_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
-
-            ON CONFLICT(symbol) DO UPDATE SET
-              bid = excluded.bid,
-              ask = excluded.ask,
-              last = excluded.last,
-              tick_time = excluded.tick_time,
-              received_at = excluded.received_at
-
-            WHERE excluded.received_at >= market_latest.received_at
-          `).bind(
+              last,
+              itemReceived
+            )];
+          }
+          return [env.DB.prepare(marketUpsert.sql).bind(
             item.symbol,
             item.bid ?? null,
             item.ask ?? null,
             item.last ?? null,
             item.time ?? null,
             itemReceived
-          );
+          )];
         });
 
         if (statements.length) {
@@ -604,22 +853,30 @@ export default {
             event: "scanner_run",
             ...scan
           }));
+          try {
+            const risk = await checkLatestSignals(env, scan.symbols);
+            console.log(JSON.stringify({
+              event: "risk_checker_run",
+              ...risk
+            }));
+          } catch (riskErr) {
+            console.error(
+              "RISK_CHECKER_FAILURE",
+              riskErr instanceof Error ? riskErr.message : String(riskErr)
+            );
+          }
         } catch (scanErr) {
           const message =
             scanErr instanceof Error ? scanErr.message : String(scanErr);
           console.error("SCANNER_FAILURE", message);
           try {
-            await env.DB.prepare(`
-              INSERT INTO system_events
-              (level, event_type, message, payload_json, created_at)
-              VALUES (?, ?, ?, ?, ?)
-            `).bind(
-              "ERROR",
-              "SCANNER_FAILURE",
-              "Deterministic scanner failed",
-              JSON.stringify({ error: message }),
-              now()
-            ).run();
+            await insertSystemEvent(env.DB, {
+              level: "ERROR",
+              event_type: "SCANNER_FAILURE",
+              message: "Deterministic scanner failed",
+              payload: JSON.stringify({ error: message }),
+              created_at: now()
+            });
           } catch {
             // logging must never throw out of the queue handler
           }
@@ -678,23 +935,13 @@ export default {
           // Phase 1: validate and log tasks.
           // Autonomous strategy reasoning comes in Phase 2.
 
-          await env.DB.prepare(`
-            INSERT INTO system_events
-            (
-              level,
-              event_type,
-              message,
-              payload_json,
-              created_at
-            )
-            VALUES (?, ?, ?, ?, ?)
-          `).bind(
-            "INFO",
-            "AGENT_TASK",
-            "Agent task received",
-            JSON.stringify(task),
-            now()
-          ).run();
+          await insertSystemEvent(env.DB, {
+            level: "INFO",
+            event_type: "AGENT_TASK",
+            message: "Agent task received",
+            payload: JSON.stringify(task),
+            created_at: now()
+          });
 
           message.ack();
 
@@ -731,21 +978,12 @@ export default {
       if (
         age > Number(env.BRIDGE_STALE_SECONDS || 45)
       ) {
-        await env.DB.prepare(`
-          INSERT INTO system_events
-          (
-            level,
-            event_type,
-            message,
-            created_at
-          )
-          VALUES (?, ?, ?, ?)
-        `).bind(
-          "WARN",
-          "BRIDGE_STALE",
-          "Windows MT5 bridge heartbeat is stale",
-          now()
-        ).run();
+        await insertSystemEvent(env.DB, {
+          level: "WARN",
+          event_type: "BRIDGE_STALE",
+          message: "Windows MT5 bridge heartbeat is stale",
+          created_at: now()
+        });
       }
 
       // Retention for scanner history (observations 48h, results 14d).
@@ -754,6 +992,14 @@ export default {
       } catch (err) {
         console.error(
           "SCANNER_PRUNE_FAILURE",
+          err instanceof Error ? err.message : String(err)
+        );
+      }
+      try {
+        await pruneRiskData(env);
+      } catch (err) {
+        console.error(
+          "RISK_RETENTION_FAILURE",
           err instanceof Error ? err.message : String(err)
         );
       }

@@ -6,6 +6,10 @@
 
 import type { Env, Tick } from "./types";
 import {
+  scannerAgentStatusUpdate,
+  tableColumns
+} from "./db_compat";
+import {
   DEFAULT_CONFIG,
   STRATEGY,
   STRATEGY_VERSION,
@@ -74,7 +78,12 @@ export async function recordAndScan(
   env: Env,
   items: IngestedTick[],
   fallbackReceivedAt: string
-): Promise<{ observations: number; evaluated: number; rejected_ticks: number }> {
+): Promise<{
+  observations: number;
+  evaluated: number;
+  rejected_ticks: number;
+  symbols: string[];
+}> {
   const config = scannerConfig(env);
   const statements: D1PreparedStatement[] = [];
   const symbols = new Set<string>();
@@ -138,24 +147,25 @@ export async function recordAndScan(
 
   if (resultStatements.length) {
     // Keep the dashboard's Agent Registry truthful about the scanner.
-    // No-op if the SCANNER row does not exist.
-    resultStatements.push(
-      env.DB.prepare(`
-        UPDATE agent_status
-        SET status = 'READY', last_seen_at = ?, detail = ?
-        WHERE agent_name = 'SCANNER'
-      `).bind(
-        new Date().toISOString(),
-        `${STRATEGY} v${STRATEGY_VERSION}: research candidates only, no order path`
-      )
+    const statusUpdate = scannerAgentStatusUpdate(
+      await tableColumns(env.DB, "agent_status"),
+      new Date().toISOString(),
+      STRATEGY,
+      `${STRATEGY} v${STRATEGY_VERSION}: research candidates only, no order path`
     );
+    if (statusUpdate) {
+      resultStatements.push(
+        env.DB.prepare(statusUpdate.sql).bind(...statusUpdate.values)
+      );
+    }
     await env.DB.batch(resultStatements);
   }
 
   return {
     observations,
     evaluated: symbols.size,
-    rejected_ticks: rejectedTicks
+    rejected_ticks: rejectedTicks,
+    symbols: [...symbols]
   };
 }
 

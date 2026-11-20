@@ -43,3 +43,27 @@ export interface MarketBatch {
   received_at?: string;
   ticks: Tick[];
 }
+
+export interface NewsCalendarEvent {
+  event_id: string;
+  name: string;
+  currency: string;
+  importance: "HIGH";
+  scheduled_at: string;
+}
+
+export interface NewsCalendarPayload {
+  generated_at: string;
+  available: boolean;
+  error?: string | null;
+  events: NewsCalendarEvent[];
+}
+
+export interface PositionSnapshotPayload {
+  captured_at: string;
+  positions: Array<{
+    symbol: string;
+    direction: "BUY" | "SELL";
+    volume: number;
+  }>;
+}

@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import httpx
 import MetaTrader5 as mt5
 from dotenv import load_dotenv
+from calendar_feed import read_calendar_snapshot
 
 load_dotenv(".env.windows")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -18,6 +19,8 @@ SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "EURUSD,GBPUSD,XAUUSD").split
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "5"))
 HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "60"))
 MARKET_BATCH_SECONDS = int(os.getenv("MARKET_BATCH_SECONDS", "60"))
+RISK_SNAPSHOT_SECONDS = int(os.getenv("RISK_SNAPSHOT_SECONDS", "60"))
+CALENDAR_FILE = os.getenv("MT5_CALENDAR_FILE", "")
 HEADERS = {"x-api-key": KEY}
 
 
@@ -78,11 +81,64 @@ def send_market_batch(client: httpx.Client):
     logging.info("Market batch accepted: %d symbols", len(ticks))
 
 
+def send_calendar_snapshot(client: httpx.Client):
+    payload = read_calendar_snapshot(CALENDAR_FILE)
+    response = client.post(
+        BASE + "/api/v1/bridge/news-calendar",
+        headers=HEADERS,
+        json=payload,
+    )
+    response.raise_for_status()
+    logging.info(
+        "Calendar snapshot accepted: available=%s events=%d",
+        payload["available"],
+        len(payload["events"]),
+    )
+
+
+def send_position_snapshot(client: httpx.Client):
+    positions = mt5.positions_get()
+    if positions is None:
+        logging.warning(
+            "MT5 positions unavailable; keeping the last snapshot stale (%s)",
+            mt5.last_error(),
+        )
+        return
+
+    items = []
+    for position in positions:
+        if position.type == mt5.POSITION_TYPE_BUY:
+            direction = "BUY"
+        elif position.type == mt5.POSITION_TYPE_SELL:
+            direction = "SELL"
+        else:
+            logging.warning("Ignoring unsupported MT5 position type: %s", position.type)
+            continue
+        items.append({
+            "symbol": str(position.symbol),
+            "direction": direction,
+            "volume": float(position.volume),
+        })
+
+    payload = {
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "positions": items,
+    }
+    response = client.post(
+        BASE + "/api/v1/bridge/positions",
+        headers=HEADERS,
+        json=payload,
+    )
+    response.raise_for_status()
+    logging.info("Position snapshot accepted: %d positions", len(items))
+
+
 def main():
     acc = connect()
     logging.info("Connected to DEMO server %s", acc.server)
     last_heartbeat = 0.0
     last_market = 0.0
+    last_risk_snapshot = 0.0
 
     with httpx.Client(timeout=15) as client:
         while True:
@@ -102,6 +158,11 @@ def main():
                 if now_mono - last_market >= MARKET_BATCH_SECONDS:
                     send_market_batch(client)
                     last_market = now_mono
+
+                if now_mono - last_risk_snapshot >= RISK_SNAPSHOT_SECONDS:
+                    send_calendar_snapshot(client)
+                    send_position_snapshot(client)
+                    last_risk_snapshot = now_mono
 
             except Exception:
                 logging.exception("Bridge cycle failed; reconnecting to MT5")

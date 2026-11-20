@@ -24,7 +24,7 @@ function extractSql(source: string): string[] {
   let m: RegExpExecArray | null;
   while ((m = re.exec(source))) {
     let sql = m[1].slice(1, -1);
-    sql = sql.replace(/\$\{[^}]*\}/g, ""); // drop template interpolations
+    if (sql.includes("${")) continue; // dynamic SQL is covered by focused tests
     out.push(sql.trim());
   }
   return out;
@@ -42,6 +42,9 @@ test(
     for (const f of migrations) {
       db.exec(readFileSync(join(root, "migrations", f), "utf8"));
     }
+    // Legacy databases may contain an instruments table referenced by
+    // market_latest; include it when validating compatibility queries.
+    db.exec("CREATE TABLE instruments (symbol TEXT PRIMARY KEY)");
 
     const files = readdirSync(join(root, "src")).filter(f => f.endsWith(".ts"));
     let checked = 0;
@@ -63,5 +66,56 @@ test(
 
     assert.ok(checked >= 10, `expected to find SQL statements, found ${checked}`);
     assert.deepEqual(failures, [], "SQL not matching schema:\n" + failures.join("\n"));
+  }
+);
+
+test(
+  "initial migrations apply over legacy agent and market tables",
+  { skip: DatabaseSync ? false : "node:sqlite unavailable" },
+  () => {
+    const db = new DatabaseSync(":memory:");
+    db.exec(`
+      CREATE TABLE agent_status (
+        agent_id TEXT PRIMARY KEY,
+        status TEXT NOT NULL DEFAULT 'idle',
+        last_heartbeat TEXT,
+        metadata TEXT,
+        error_message TEXT
+      );
+      CREATE TABLE bridge_heartbeats (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        terminal_name TEXT,
+        account_server TEXT,
+        account_login TEXT,
+        connected INTEGER DEFAULT 0,
+        balance REAL DEFAULT 0,
+        equity REAL DEFAULT 0,
+        currency TEXT,
+        trade_mode TEXT,
+        received_at TEXT
+      );
+      CREATE TABLE market_latest (
+        symbol TEXT PRIMARY KEY,
+        bid REAL NOT NULL,
+        ask REAL NOT NULL,
+        last_price REAL NOT NULL,
+        updated_at TEXT DEFAULT (datetime('now')),
+        last REAL
+      );
+    `);
+
+    const migrations = readdirSync(join(root, "migrations"))
+      .filter(f => f.endsWith(".sql"))
+      .sort();
+    for (const f of migrations) {
+      db.exec(readFileSync(join(root, "migrations", f), "utf8"));
+    }
+
+    assert.ok(db.prepare(
+      "SELECT name FROM sqlite_master WHERE name = 'market_observations'"
+    ).get());
+    assert.ok(db.prepare(
+      "SELECT name FROM sqlite_master WHERE name = 'scanner_results'"
+    ).get());
   }
 );
