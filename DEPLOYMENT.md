@@ -34,7 +34,28 @@ npx wrangler r2 bucket create warroom-market-archive
 ```
 Copy the D1 database_id into wrangler.jsonc. Queue producer/consumer names and R2 bucket name must match exactly.
 
-## 3. Apply D1 migration
+## 3. Apply D1 migrations
+Migrations: `0001_init.sql` (core tables) and `0002_scanner.sql` (scanner observations and results; additive only).
+
+Validate locally first, and do not continue if anything fails:
+```bash
+npm ci
+npm run typecheck
+npm test
+npx wrangler d1 migrations apply warroom-db --local
+npx wrangler deploy --dry-run
+```
+
+Before touching an existing remote database, back it up and confirm its real schema matches the migrations (the code assumes exactly these columns):
+```bash
+npx wrangler d1 export warroom-db --remote --output backup-$(date +%F).sql
+npx wrangler d1 execute warroom-db --remote --command "PRAGMA table_info(agent_status)"
+npx wrangler d1 execute warroom-db --remote --command "PRAGMA table_info(equity_snapshots)"
+npx wrangler d1 migrations list warroom-db --remote
+```
+`agent_status` must have `agent_name`, `status`, `last_seen_at`, `detail`. `equity_snapshots` must have `balance`, `equity`, `floating_pnl`, `currency`, `captured_at` (no account column). If the remote differs, stop and reconcile before applying anything.
+
+Then apply:
 ```bash
 npx wrangler d1 migrations apply warroom-db --remote
 ```
@@ -74,6 +95,11 @@ Set `WARROOM_API_URL` to the deployed Worker URL, `WARROOM_API_KEY` to the secre
 - Dashboard shows agents, heartbeat, and market symbols.
 - `GET /api/v1/system/config` reports `execution_enabled:false`.
 - `POST /api/v1/trading/execute` is not an active order route; execution remains locked.
+- `GET /api/v1/scanner/status` and `GET /api/v1/scanner/latest` (both require the `x-api-key` header). Right after deploy every symbol is `WARMING_UP`; with 60s batches it takes about 20 minutes to reach 20 observations.
+- `GET /api/v1/bridge/status` returns liveness only (no account login, server, balance or equity).
+
+## Deterministic scanner (SNAPSHOT_MOMENTUM_V1)
+Research-only: it produces BUY / SELL / WATCH / WARMING_UP / REJECTED candidates from SMA 5/20, momentum and spread, and writes every evaluation to `scanner_results` for audit. It has no path to the executor; `TRADING_ENABLED=false` and `PAPER_MODE=true` must stay set. The score is a rule score, not a probability of profit. Spread limits and trend/momentum thresholds in `src/scanner.ts` are untuned starting values; review them against real spreads in `market_observations`. Observations are kept 48 hours and results 14 days (pruned by the cron trigger).
 
 ## Notes on the architecture
 - Queue delivery can retry. Consumers must be idempotent; never treat a queue delivery as proof that a broker order has executed.
