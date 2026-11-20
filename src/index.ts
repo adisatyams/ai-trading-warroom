@@ -3,6 +3,13 @@ import type { Env, Heartbeat, MarketBatch, Tick } from "./types";
 import { authorized, json } from "./security";
 import { AccountCoordinator } from "./coordinator";
 import {
+  agentStatusSelect,
+  insertSystemEvent,
+  marketLatestSelect,
+  marketLatestUpsert,
+  tableColumns
+} from "./db_compat";
+import {
   SCANNER_STATES,
   latestResults,
   pruneScanner,
@@ -117,15 +124,13 @@ export default {
         url.pathname === "/api/v1/agents" &&
         request.method === "GET"
       ) {
-        const result = await env.DB.prepare(`
-          SELECT
-            agent_name AS name,
-            status,
-            COALESCE(detail, '') AS detail,
-            last_seen_at
-          FROM agent_status
-          ORDER BY agent_name
-        `).all();
+        const query = agentStatusSelect(
+          await tableColumns(env.DB, "agent_status")
+        );
+        if (!query) {
+          return json({ error: "Unsupported agent_status schema" }, 503);
+        }
+        const result = await env.DB.prepare(query).all();
 
         return json({
           agents: result.results,
@@ -195,26 +200,32 @@ export default {
           body.balance !== undefined ||
           body.equity !== undefined
         ) {
-          await env.DB.prepare(`
-            INSERT INTO equity_snapshots
-            (
-              balance,
-              equity,
-              floating_pnl,
-              currency,
-              captured_at
-            )
-            VALUES (?, ?, ?, ?, ?)
-          `).bind(
-            body.balance ?? null,
-            body.equity ?? null,
-            body.equity !== undefined &&
-            body.balance !== undefined
-              ? body.equity - body.balance
-              : null,
-            body.currency ?? null,
-            now()
-          ).run();
+          const equityColumns = await tableColumns(env.DB, "equity_snapshots");
+          // Legacy databases require an account_id, which the telemetry-only
+          // bridge deliberately does not send. The values remain available in
+          // bridge_heartbeats until the account schema is reconciled.
+          if (!equityColumns.has("account_id")) {
+            await env.DB.prepare(`
+              INSERT INTO equity_snapshots
+              (
+                balance,
+                equity,
+                floating_pnl,
+                currency,
+                captured_at
+              )
+              VALUES (?, ?, ?, ?, ?)
+            `).bind(
+              body.balance ?? null,
+              body.equity ?? null,
+              body.equity !== undefined &&
+              body.balance !== undefined
+                ? body.equity - body.balance
+                : null,
+              body.currency ?? null,
+              now()
+            ).run();
+          }
         }
 
         return json({
@@ -367,7 +378,7 @@ export default {
         return json({
           terminal_name: row.terminal_name,
           connected: !!row.connected,
-          demo: row.trade_mode === 0,
+          demo: Number(row.trade_mode) === 0,
           received_at: row.received_at,
           age_seconds: Math.round(age),
           fresh: age <= Number(env.BRIDGE_STALE_SECONDS || 45)
@@ -381,11 +392,13 @@ export default {
         url.pathname === "/api/v1/market/latest" &&
         request.method === "GET"
       ) {
-        const rows = await env.DB.prepare(`
-          SELECT *
-          FROM market_latest
-          ORDER BY symbol
-        `).all();
+        const query = marketLatestSelect(
+          await tableColumns(env.DB, "market_latest")
+        );
+        if (!query) {
+          return json({ error: "Unsupported market_latest schema" }, 503);
+        }
+        const rows = await env.DB.prepare(query).all();
 
         return json({
           items: rows.results
@@ -553,38 +566,56 @@ export default {
           }
         });
 
-        const statements = items.map(item => {
+        const marketColumns = await tableColumns(env.DB, "market_latest");
+        const marketUpsert = marketLatestUpsert(marketColumns);
+        if (!marketUpsert) {
+          throw new Error("Unsupported market_latest schema");
+        }
+        const instrumentColumns = marketUpsert.legacy
+          ? await tableColumns(env.DB, "instruments")
+          : new Set<string>();
+        const knownSymbols = new Set<string>();
+        if (marketUpsert.legacy && instrumentColumns.has("symbol")) {
+          const known = await env.DB.prepare(
+            "SELECT symbol FROM instruments"
+          ).all<{ symbol: string }>();
+          for (const row of known.results) knownSymbols.add(row.symbol);
+        }
+
+        const statements = items.flatMap(item => {
           const itemReceived =
             item.received_at || received;
 
-          return env.DB.prepare(`
-            INSERT INTO market_latest
-            (
-              symbol,
-              bid,
-              ask,
+          if (
+            marketUpsert.legacy &&
+            (!knownSymbols.has(item.symbol) ||
+              !Number.isFinite(item.bid) ||
+              !Number.isFinite(item.ask) ||
+              item.bid! <= 0 ||
+              item.ask! < item.bid!)
+          ) {
+            return [];
+          }
+
+          if (marketUpsert.legacy) {
+            const last = item.last ?? (item.bid! + item.ask!) / 2;
+            return [env.DB.prepare(marketUpsert.sql).bind(
+              item.symbol,
+              item.bid,
+              item.ask,
               last,
-              tick_time,
-              received_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
-
-            ON CONFLICT(symbol) DO UPDATE SET
-              bid = excluded.bid,
-              ask = excluded.ask,
-              last = excluded.last,
-              tick_time = excluded.tick_time,
-              received_at = excluded.received_at
-
-            WHERE excluded.received_at >= market_latest.received_at
-          `).bind(
+              last,
+              itemReceived
+            )];
+          }
+          return [env.DB.prepare(marketUpsert.sql).bind(
             item.symbol,
             item.bid ?? null,
             item.ask ?? null,
             item.last ?? null,
             item.time ?? null,
             itemReceived
-          );
+          )];
         });
 
         if (statements.length) {
@@ -609,17 +640,13 @@ export default {
             scanErr instanceof Error ? scanErr.message : String(scanErr);
           console.error("SCANNER_FAILURE", message);
           try {
-            await env.DB.prepare(`
-              INSERT INTO system_events
-              (level, event_type, message, payload_json, created_at)
-              VALUES (?, ?, ?, ?, ?)
-            `).bind(
-              "ERROR",
-              "SCANNER_FAILURE",
-              "Deterministic scanner failed",
-              JSON.stringify({ error: message }),
-              now()
-            ).run();
+            await insertSystemEvent(env.DB, {
+              level: "ERROR",
+              event_type: "SCANNER_FAILURE",
+              message: "Deterministic scanner failed",
+              payload: JSON.stringify({ error: message }),
+              created_at: now()
+            });
           } catch {
             // logging must never throw out of the queue handler
           }
@@ -678,23 +705,13 @@ export default {
           // Phase 1: validate and log tasks.
           // Autonomous strategy reasoning comes in Phase 2.
 
-          await env.DB.prepare(`
-            INSERT INTO system_events
-            (
-              level,
-              event_type,
-              message,
-              payload_json,
-              created_at
-            )
-            VALUES (?, ?, ?, ?, ?)
-          `).bind(
-            "INFO",
-            "AGENT_TASK",
-            "Agent task received",
-            JSON.stringify(task),
-            now()
-          ).run();
+          await insertSystemEvent(env.DB, {
+            level: "INFO",
+            event_type: "AGENT_TASK",
+            message: "Agent task received",
+            payload: JSON.stringify(task),
+            created_at: now()
+          });
 
           message.ack();
 
@@ -731,21 +748,12 @@ export default {
       if (
         age > Number(env.BRIDGE_STALE_SECONDS || 45)
       ) {
-        await env.DB.prepare(`
-          INSERT INTO system_events
-          (
-            level,
-            event_type,
-            message,
-            created_at
-          )
-          VALUES (?, ?, ?, ?)
-        `).bind(
-          "WARN",
-          "BRIDGE_STALE",
-          "Windows MT5 bridge heartbeat is stale",
-          now()
-        ).run();
+        await insertSystemEvent(env.DB, {
+          level: "WARN",
+          event_type: "BRIDGE_STALE",
+          message: "Windows MT5 bridge heartbeat is stale",
+          created_at: now()
+        });
       }
 
       // Retention for scanner history (observations 48h, results 14d).
