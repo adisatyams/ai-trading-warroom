@@ -1,4 +1,4 @@
-// Deterministic scanner SNAPSHOT_MOMENTUM_V1.
+// Deterministic multi-timeframe scanner.
 //
 // Pure module: no Cloudflare bindings, no I/O, no clock access. All inputs are
 // passed in, so every result can be reproduced and unit-tested.
@@ -6,8 +6,12 @@
 // The scanner produces RESEARCH CANDIDATES only. It never sends orders and its
 // score is a rule score, not a probability of profit.
 
-export const STRATEGY = "SNAPSHOT_MOMENTUM_V1";
+export const STRATEGY = "MULTI_TIMEFRAME_INDICATORS_V1";
 export const STRATEGY_VERSION = "1.0.0";
+export const LEGACY_STRATEGY = "SNAPSHOT_MOMENTUM_V1";
+
+export const SCANNER_TIMEFRAMES = ["M5", "M15", "H1", "H4"] as const;
+export type ScannerTimeframe = typeof SCANNER_TIMEFRAMES[number];
 
 export type ScannerState =
   | "BUY"
@@ -20,7 +24,10 @@ export type RejectReason =
   | "STALE_DATA"
   | "INVALID_PRICE"
   | "SPREAD_TOO_WIDE"
-  | "OUT_OF_ORDER";
+  | "OUT_OF_ORDER"
+  | "INVALID_CANDLES"
+  | "STALE_CANDLES"
+  | "MISSING_QUOTE";
 
 export interface Observation {
   symbol: string;
@@ -49,6 +56,17 @@ export interface ScannerConfig {
   /** Default spread ceiling in bps when a symbol has no specific limit. */
   defaultMaxSpreadBps: number;
   maxSpreadBpsBySymbol: Record<string, number>;
+  emaShortPeriod: number;
+  emaMediumPeriod: number;
+  emaLongPeriod: number;
+  rsiPeriod: number;
+  macdFastPeriod: number;
+  macdSlowPeriod: number;
+  macdSignalPeriod: number;
+  atrPeriod: number;
+  bollingerPeriod: number;
+  bollingerStdDev: number;
+  minSignalScore: number;
 }
 
 // NOTE: starting values chosen for explainability, NOT tuned or backtested.
@@ -68,7 +86,18 @@ export const DEFAULT_CONFIG: ScannerConfig = {
     XAUUSD: 8,
     BTCUSD: 20,
     ETHUSD: 25
-  }
+  },
+  emaShortPeriod: 20,
+  emaMediumPeriod: 50,
+  emaLongPeriod: 200,
+  rsiPeriod: 14,
+  macdFastPeriod: 12,
+  macdSlowPeriod: 26,
+  macdSignalPeriod: 9,
+  atrPeriod: 14,
+  bollingerPeriod: 20,
+  bollingerStdDev: 2,
+  minSignalScore: 70
 };
 
 export interface ScannerFeatures {
@@ -83,24 +112,63 @@ export interface ScannerFeatures {
   max_spread_bps: number | null;
   age_seconds: number | null;
   window_seconds: number | null;
+  ema20: number | null;
+  ema50: number | null;
+  ema200: number | null;
+  rsi14: number | null;
+  macd: number | null;
+  macd_signal: number | null;
+  macd_histogram: number | null;
+  atr14: number | null;
+  atr_ratio: number | null;
+  bollinger_upper: number | null;
+  bollinger_middle: number | null;
+  bollinger_lower: number | null;
+  buy_score: number | null;
+  sell_score: number | null;
 }
 
 export interface ScannerResult {
   signal_id: string;
   symbol: string;
+  timeframe: ScannerTimeframe | "M1";
   strategy: string;
   strategy_version: string;
   state: ScannerState;
   reject_reason: RejectReason | null;
-  /** 0-100 rule score for BUY/SELL only; null otherwise. Not a probability. */
+  /** 0-100 heuristic score; not a probability of profit. */
   score: number | null;
+  entry: number | null;
+  stop_loss: number | null;
+  take_profit: number | null;
   /** Timestamp of the newest observation this result is based on. */
   as_of: string | null;
   features: ScannerFeatures;
   reasons: string[];
 }
 
+export interface Candle {
+  time: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  tick_volume?: number;
+}
+
+export interface ScannerQuote {
+  bid: number;
+  ask: number;
+  received_at: string;
+}
+
 const BPS = 10_000;
+const TIMEFRAME_SECONDS: Record<ScannerTimeframe, number> = {
+  M5: 300,
+  M15: 900,
+  H1: 3_600,
+  H4: 14_400
+};
 
 export function isValidQuote(bid: unknown, ask: unknown): boolean {
   return (
@@ -155,8 +223,13 @@ function maxSpreadForSymbol(
 }
 
 /** Deterministic id: the same symbol + newest observation always yields the same id. */
-export function signalId(symbol: string, asOf: string | null): string {
-  return `${STRATEGY}:${symbol}:${asOf ?? "none"}`;
+export function signalId(
+  symbol: string,
+  asOf: string | null,
+  timeframe: ScannerTimeframe | "M1" = "M1",
+  strategy = STRATEGY
+): string {
+  return `${strategy}:${symbol}:${timeframe}:${asOf ?? "none"}`;
 }
 
 function emptyFeatures(): ScannerFeatures {
@@ -171,7 +244,21 @@ function emptyFeatures(): ScannerFeatures {
     spread_bps: null,
     max_spread_bps: null,
     age_seconds: null,
-    window_seconds: null
+    window_seconds: null,
+    ema20: null,
+    ema50: null,
+    ema200: null,
+    rsi14: null,
+    macd: null,
+    macd_signal: null,
+    macd_histogram: null,
+    atr14: null,
+    atr_ratio: null,
+    bollinger_upper: null,
+    bollinger_middle: null,
+    bollinger_lower: null,
+    buy_score: null,
+    sell_score: null
   };
 }
 
@@ -181,16 +268,29 @@ function result(
   state: ScannerState,
   features: ScannerFeatures,
   reasons: string[],
-  extra: { reject_reason?: RejectReason; score?: number } = {}
+  extra: {
+    reject_reason?: RejectReason;
+    score?: number;
+    timeframe?: ScannerTimeframe | "M1";
+    strategy?: string;
+    entry?: number | null;
+    stop_loss?: number | null;
+    take_profit?: number | null;
+  } = {}
 ): ScannerResult {
+  const timeframe = extra.timeframe ?? "M1";
   return {
-    signal_id: signalId(symbol, asOf),
+    signal_id: signalId(symbol, asOf, timeframe, extra.strategy ?? LEGACY_STRATEGY),
     symbol,
-    strategy: STRATEGY,
+    timeframe,
+    strategy: extra.strategy ?? LEGACY_STRATEGY,
     strategy_version: STRATEGY_VERSION,
     state,
     reject_reason: extra.reject_reason ?? null,
     score: extra.score ?? null,
+    entry: extra.entry ?? null,
+    stop_loss: extra.stop_loss ?? null,
+    take_profit: extra.take_profit ?? null,
     as_of: asOf,
     features,
     reasons
@@ -220,6 +320,7 @@ export function rejectInvalidTick(
  * @param observations  chronological order, OLDEST FIRST
  * @param nowMs         current time in epoch ms (injected for determinism)
  */
+/** Legacy observation-only evaluator; production uses evaluateTimeframe. */
 export function evaluate(
   symbol: string,
   observations: Observation[],
@@ -423,4 +524,329 @@ export function evaluate(
     ],
     { score }
   );
+}
+
+function emaSeries(values: number[], period: number): Array<number | null> {
+  const output: Array<number | null> = Array(values.length).fill(null);
+  if (values.length < period) return output;
+
+  let average = sma(values.slice(0, period));
+  output[period - 1] = average;
+  const multiplier = 2 / (period + 1);
+  for (let index = period; index < values.length; index++) {
+    average = values[index] * multiplier + average * (1 - multiplier);
+    output[index] = average;
+  }
+  return output;
+}
+
+function rsiSeries(values: number[], period: number): Array<number | null> {
+  const output: Array<number | null> = Array(values.length).fill(null);
+  if (values.length <= period) return output;
+
+  let gains = 0;
+  let losses = 0;
+  for (let index = 1; index <= period; index++) {
+    const change = values[index] - values[index - 1];
+    gains += Math.max(change, 0);
+    losses += Math.max(-change, 0);
+  }
+  let averageGain = gains / period;
+  let averageLoss = losses / period;
+  const currentRsi = () =>
+    averageLoss === 0
+      ? averageGain === 0 ? 50 : 100
+      : 100 - 100 / (1 + averageGain / averageLoss);
+  output[period] = currentRsi();
+
+  for (let index = period + 1; index < values.length; index++) {
+    const change = values[index] - values[index - 1];
+    averageGain =
+      (averageGain * (period - 1) + Math.max(change, 0)) / period;
+    averageLoss =
+      (averageLoss * (period - 1) + Math.max(-change, 0)) / period;
+    output[index] = currentRsi();
+  }
+  return output;
+}
+
+function atrSeries(candles: Candle[], period: number): Array<number | null> {
+  const output: Array<number | null> = Array(candles.length).fill(null);
+  if (candles.length <= period) return output;
+  const trueRanges = candles.slice(1).map((candle, index) => {
+    const previousClose = candles[index].close;
+    return Math.max(
+      candle.high - candle.low,
+      Math.abs(candle.high - previousClose),
+      Math.abs(candle.low - previousClose)
+    );
+  });
+  let atr =
+    trueRanges.slice(0, period).reduce((sum, range) => sum + range, 0) /
+    period;
+  output[period] = atr;
+  for (let index = period + 1; index < candles.length; index++) {
+    atr = (atr * (period - 1) + trueRanges[index - 1]) / period;
+    output[index] = atr;
+  }
+  return output;
+}
+
+function median(values: number[]): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2
+    ? sorted[middle]
+    : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+function validCandle(candle: Candle): boolean {
+  return (
+    typeof candle.time === "string" &&
+    Number.isFinite(Date.parse(candle.time)) &&
+    [candle.open, candle.high, candle.low, candle.close].every(
+      value => Number.isFinite(value) && value > 0
+    ) &&
+    candle.high >= candle.low &&
+    candle.high >= candle.open &&
+    candle.high >= candle.close &&
+    candle.low <= candle.open &&
+    candle.low <= candle.close
+  );
+}
+
+/**
+ * Score a completed-candle snapshot for one symbol/timeframe. The weighted
+ * score is a deterministic heuristic, not a probability of profit.
+ */
+export function evaluateTimeframe(
+  symbol: string,
+  timeframe: ScannerTimeframe,
+  candles: Candle[],
+  quote: ScannerQuote | null,
+  nowMs: number,
+  m1Atr: number | null,
+  config: ScannerConfig = DEFAULT_CONFIG
+): ScannerResult {
+  const asOf = candles.length ? candles[candles.length - 1].time : null;
+  const features = emptyFeatures();
+  const finish = (
+    state: ScannerState,
+    reasons: string[],
+    extra: {
+      reject_reason?: RejectReason;
+      score?: number;
+      entry?: number | null;
+      stop_loss?: number | null;
+      take_profit?: number | null;
+    } = {}
+  ) => result(symbol, asOf, state, features, reasons, {
+    ...extra,
+    timeframe,
+    strategy: STRATEGY
+  });
+
+  if (candles.length < config.emaLongPeriod) {
+    return finish("WARMING_UP", [
+      `Need ${config.emaLongPeriod} completed ${timeframe} candles for EMA${config.emaLongPeriod}; have ${candles.length}`
+    ]);
+  }
+  for (let index = 0; index < candles.length; index++) {
+    if (!validCandle(candles[index])) {
+      return finish("REJECTED", [`Invalid OHLC candle at index ${index}`], {
+        reject_reason: "INVALID_CANDLES"
+      });
+    }
+    if (
+      index > 0 &&
+      Date.parse(candles[index].time) <= Date.parse(candles[index - 1].time)
+    ) {
+      return finish(
+        "REJECTED",
+        [`Candle times are not strictly increasing at index ${index}`],
+        { reject_reason: "INVALID_CANDLES" }
+      );
+    }
+  }
+
+  const latest = candles[candles.length - 1];
+  const candleAge = (nowMs - Date.parse(latest.time)) / 1000;
+  const maxCandleAge = Math.max(
+    config.staleSeconds,
+    TIMEFRAME_SECONDS[timeframe] * 2
+  );
+  features.age_seconds = round(candleAge, 1);
+  if (
+    !Number.isFinite(candleAge) ||
+    candleAge < 0 ||
+    candleAge > maxCandleAge
+  ) {
+    return finish(
+      "REJECTED",
+      [`Latest ${timeframe} candle is stale (${Math.round(candleAge)}s; limit ${maxCandleAge}s)`],
+      { reject_reason: "STALE_CANDLES" }
+    );
+  }
+  if (
+    !quote ||
+    !isValidQuote(quote.bid, quote.ask) ||
+    !Number.isFinite(Date.parse(quote.received_at)) ||
+    (nowMs - Date.parse(quote.received_at)) / 1000 < 0 ||
+    (nowMs - Date.parse(quote.received_at)) / 1000 > config.staleSeconds
+  ) {
+    return finish("REJECTED", ["A fresh valid quote is required"], {
+      reject_reason: "MISSING_QUOTE"
+    });
+  }
+
+  const spread = spreadBps(quote);
+  const maxSpread = maxSpreadForSymbol(symbol, config);
+  const mid = midPrice(quote);
+  features.observations_used = candles.length;
+  features.contiguous_observations = candles.length;
+  features.mid = round(mid, 8);
+  features.spread_bps = round(spread, 3);
+  features.max_spread_bps = maxSpread;
+  if (spread > maxSpread) {
+    return finish(
+      "REJECTED",
+      [`Spread ${spread.toFixed(2)} bps exceeds limit ${maxSpread} bps`],
+      { reject_reason: "SPREAD_TOO_WIDE" }
+    );
+  }
+
+  const closes = candles.map(candle => candle.close);
+  const emaShortSeries = emaSeries(closes, config.emaShortPeriod);
+  const emaMediumSeries = emaSeries(closes, config.emaMediumPeriod);
+  const emaLongSeries = emaSeries(closes, config.emaLongPeriod);
+  const last = candles.length - 1;
+  const emaShort = emaShortSeries[last];
+  const emaMedium = emaMediumSeries[last];
+  const emaLong = emaLongSeries[last];
+  const fast = emaSeries(closes, config.macdFastPeriod);
+  const slow = emaSeries(closes, config.macdSlowPeriod);
+  const macdValues: number[] = [];
+  for (let index = 0; index < closes.length; index++) {
+    if (fast[index] !== null && slow[index] !== null) {
+      macdValues.push(fast[index]! - slow[index]!);
+    }
+  }
+  const macdSignalSeries = emaSeries(macdValues, config.macdSignalPeriod);
+  const macd = macdValues.length ? macdValues[macdValues.length - 1] : null;
+  const macdSignal = macdSignalSeries.length
+    ? macdSignalSeries[macdSignalSeries.length - 1]
+    : null;
+  const rsiValues = rsiSeries(closes, config.rsiPeriod);
+  const rsi = rsiValues[last];
+  const atrs = atrSeries(candles, config.atrPeriod);
+  const atr = atrs[last];
+  const priorAtrs = atrs
+    .slice(-21, -1)
+    .filter((value): value is number => value !== null);
+  const atrRatio =
+    atr !== null && priorAtrs.length ? atr / median(priorAtrs) : null;
+
+  const bandPrices = closes.slice(-config.bollingerPeriod);
+  const bandMiddle = sma(bandPrices);
+  const bandVariance = bandPrices.reduce(
+    (sum, close) => sum + (close - bandMiddle) ** 2,
+    0
+  ) / bandPrices.length;
+  const bandDeviation = Math.sqrt(bandVariance);
+  const bandUpper = bandMiddle + config.bollingerStdDev * bandDeviation;
+  const bandLower = bandMiddle - config.bollingerStdDev * bandDeviation;
+  const priorCandles = candles.slice(-config.bollingerPeriod - 1, -1);
+  const breakoutUp =
+    latest.close > bandUpper ||
+    latest.close > Math.max(...priorCandles.map(candle => candle.high));
+  const breakoutDown =
+    latest.close < bandLower ||
+    latest.close < Math.min(...priorCandles.map(candle => candle.low));
+
+  if (
+    emaShort === null ||
+    emaMedium === null ||
+    emaLong === null ||
+    macd === null ||
+    macdSignal === null ||
+    rsi === null ||
+    atr === null ||
+    atrRatio === null
+  ) {
+    return finish("WARMING_UP", ["Indicator history is not ready"]);
+  }
+
+  features.ema20 = round(emaShort, 8);
+  features.ema50 = round(emaMedium, 8);
+  features.ema200 = round(emaLong, 8);
+  features.rsi14 = round(rsi, 3);
+  features.macd = round(macd, 8);
+  features.macd_signal = round(macdSignal, 8);
+  features.macd_histogram = round(macd - macdSignal, 8);
+  features.atr14 = round(atr, 8);
+  features.atr_ratio = round(atrRatio, 3);
+  features.bollinger_upper = round(bandUpper, 8);
+  features.bollinger_middle = round(bandMiddle, 8);
+  features.bollinger_lower = round(bandLower, 8);
+
+  const trendUp =
+    emaShort > emaMedium && emaMedium > emaLong && latest.close > emaShort;
+  const trendDown =
+    emaShort < emaMedium && emaMedium < emaLong && latest.close < emaShort;
+  const macdUp = macd > macdSignal;
+  const macdDown = macd < macdSignal;
+  const rsiUp = rsi >= 50 && rsi < 70;
+  const rsiDown = rsi <= 50 && rsi > 30;
+  const volatilityPoints =
+    atrRatio >= 0.75 && atrRatio <= 2
+      ? 15
+      : atrRatio >= 0.5 && atrRatio <= 2.5
+        ? 8
+        : 0;
+  const buyScore =
+    (trendUp ? 25 : 0) +
+    (macdUp ? 25 : 0) +
+    (rsiUp ? 15 : 0) +
+    (breakoutUp ? 20 : 0) +
+    volatilityPoints;
+  const sellScore =
+    (trendDown ? 25 : 0) +
+    (macdDown ? 25 : 0) +
+    (rsiDown ? 15 : 0) +
+    (breakoutDown ? 20 : 0) +
+    volatilityPoints;
+  features.buy_score = buyScore;
+  features.sell_score = sellScore;
+
+  const score = Math.max(buyScore, sellScore);
+  const state: ScannerState =
+    score < config.minSignalScore
+      ? "WATCH"
+      : buyScore >= sellScore ? "BUY" : "SELL";
+  const reasons = [
+    `Heuristic score: BUY ${buyScore}/100, SELL ${sellScore}/100; threshold ${config.minSignalScore}`,
+    `EMA trend ${trendUp ? "up" : trendDown ? "down" : "not aligned"}; MACD ${macdUp ? "bullish" : macdDown ? "bearish" : "neutral"}; RSI ${rsi.toFixed(1)}`,
+    `Breakout ${breakoutUp ? "up" : breakoutDown ? "down" : "none"}; ATR ratio ${atrRatio.toFixed(2)}`
+  ];
+  if (state === "WATCH") {
+    return finish(state, reasons, { score });
+  }
+
+  const direction = state === "BUY" ? 1 : -1;
+  const entry = state === "BUY" ? quote.ask : quote.bid;
+  const stopDistance =
+    m1Atr && Number.isFinite(m1Atr) && m1Atr > 0 ? m1Atr * 2 : null;
+  const stopLoss =
+    stopDistance === null ? null : entry - direction * stopDistance;
+  const takeProfit =
+    stopDistance === null ? null : entry + direction * stopDistance * 2;
+  if (stopDistance === null) {
+    reasons.push("M1 ATR(14) unavailable; SL/TP are not calculated");
+  }
+  return finish(state, reasons, {
+    score,
+    entry: round(entry, 8),
+    stop_loss: stopLoss === null ? null : round(stopLoss, 8),
+    take_profit: takeProfit === null ? null : round(takeProfit, 8)
+  });
 }

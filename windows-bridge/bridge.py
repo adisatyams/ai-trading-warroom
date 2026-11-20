@@ -15,12 +15,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 BASE = os.environ["WARROOM_API_URL"].rstrip("/")
 KEY = os.environ["WARROOM_API_KEY"]
 PATH = os.getenv("MT5_PATH", "")
-DEFAULT_SYMBOLS = "XAUUSDm,EURUSDm,GBPUSDm,USDJPYm,AUDUSDm,USDCADm,BTCUSDm,ETHUSDm"
-SYMBOLS = [
-    symbol.strip()
-    for symbol in os.getenv("SYMBOLS", DEFAULT_SYMBOLS).split(",")
-    if symbol.strip()
-]
+SYMBOLS = []
+SCANNER_TIMEFRAMES = {
+    "M5": mt5.TIMEFRAME_M5,
+    "M15": mt5.TIMEFRAME_M15,
+    "H1": mt5.TIMEFRAME_H1,
+    "H4": mt5.TIMEFRAME_H4,
+}
+SCANNER_CANDLE_COUNT = 220
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "5"))
 HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "60"))
 MARKET_BATCH_SECONDS = int(os.getenv("MARKET_BATCH_SECONDS", "60"))
@@ -39,10 +41,23 @@ def connect():
     if acc.trade_mode != mt5.ACCOUNT_TRADE_MODE_DEMO:
         mt5.shutdown()
         raise RuntimeError("Only an MT5 DEMO account is allowed by this telemetry bridge.")
-    for symbol in SYMBOLS:
-        if not mt5.symbol_select(symbol, True):
-            logging.warning("Symbol unavailable: %s (%s)", symbol, mt5.last_error())
+    refresh_symbols()
     return acc
+
+
+def refresh_symbols():
+    instruments = mt5.symbols_get()
+    if instruments is None:
+        raise RuntimeError(f"MT5 symbols_get failed: {mt5.last_error()}")
+    visible = sorted(
+        str(instrument.name)
+        for instrument in instruments
+        if instrument.visible and instrument.name
+    )
+    if not visible:
+        raise RuntimeError("MT5 Market Watch has no visible instruments")
+    SYMBOLS[:] = visible
+    logging.info("Market Watch instruments loaded: %d", len(SYMBOLS))
 
 
 def send_heartbeat(client: httpx.Client, acc):
@@ -78,12 +93,71 @@ def send_market_batch(client: httpx.Client):
     if not ticks:
         logging.warning("No market ticks available; no Queue message sent")
         return
-    response = client.post(BASE + "/api/v1/bridge/market-batch", headers=HEADERS, json={
-        "batch_id": str(uuid.uuid4()),
-        "ticks": ticks,
-    })
-    response.raise_for_status()
+    for offset in range(0, len(ticks), 10):
+        response = client.post(
+            BASE + "/api/v1/bridge/market-batch",
+            headers=HEADERS,
+            json={
+                "batch_id": str(uuid.uuid4()),
+                "ticks": ticks[offset:offset + 10],
+            },
+        )
+        response.raise_for_status()
     logging.info("Market batch accepted: %d symbols", len(ticks))
+
+
+def send_scanner_candles(client: httpx.Client):
+    captured_at = datetime.now(timezone.utc).isoformat()
+    symbols = []
+    for symbol in SYMBOLS:
+        timeframes = []
+        for name, mt5_timeframe in SCANNER_TIMEFRAMES.items():
+            rates = mt5.copy_rates_from_pos(
+                symbol, mt5_timeframe, 1, SCANNER_CANDLE_COUNT
+            )
+            if rates is None:
+                timeframes.append({
+                    "timeframe": name,
+                    "available": False,
+                    "error": f"MT5 candles unavailable: {mt5.last_error()}",
+                    "candles": [],
+                })
+                continue
+            ordered_rates = sorted(
+                rates, key=lambda rate: int(rate["time"])
+            )[-SCANNER_CANDLE_COUNT:]
+            candles = [{
+                "time": datetime.fromtimestamp(
+                    int(rate["time"]), timezone.utc
+                ).isoformat(),
+                "open": float(rate["open"]),
+                "high": float(rate["high"]),
+                "low": float(rate["low"]),
+                "close": float(rate["close"]),
+                "tick_volume": int(rate["tick_volume"]),
+            } for rate in ordered_rates]
+            timeframes.append({
+                "timeframe": name,
+                "available": True,
+                "error": None,
+                "candles": candles,
+            })
+        symbols.append({"symbol": symbol, "timeframes": timeframes})
+
+    for offset in range(0, len(symbols), 5):
+        response = client.post(
+            BASE + "/api/v1/bridge/scanner-candles",
+            headers=HEADERS,
+            json={
+                "captured_at": captured_at,
+                "symbols": symbols[offset:offset + 5],
+            },
+        )
+        response.raise_for_status()
+    logging.info(
+        "Scanner candles accepted: %d symbols across M5/M15/H1/H4",
+        len(symbols),
+    )
 
 
 def send_calendar_snapshot(client: httpx.Client):
@@ -166,6 +240,7 @@ def send_sizing_inputs(client: httpx.Client):
         spec = {
             "tick_size": float(info.trade_tick_size),
             "tick_value_loss": float(info.trade_tick_value_loss),
+            "contract_size": float(info.trade_contract_size),
             "volume_min": float(info.volume_min),
             "volume_max": float(info.volume_max),
             "volume_step": float(info.volume_step),
@@ -188,12 +263,16 @@ def send_sizing_inputs(client: httpx.Client):
             "spec": spec,
         })
 
-    response = client.post(
-        BASE + "/api/v1/bridge/sizing-inputs",
-        headers=HEADERS,
-        json={"captured_at": captured_at, "symbols": items},
-    )
-    response.raise_for_status()
+    for offset in range(0, len(items), 10):
+        response = client.post(
+            BASE + "/api/v1/bridge/sizing-inputs",
+            headers=HEADERS,
+            json={
+                "captured_at": captured_at,
+                "symbols": items[offset:offset + 10],
+            },
+        )
+        response.raise_for_status()
     available = sum(1 for item in items if item["available"])
     logging.info(
         "Position sizing inputs accepted: %d/%d symbols available",
@@ -229,9 +308,11 @@ def main():
                     last_market = now_mono
 
                 if now_mono - last_risk_snapshot >= RISK_SNAPSHOT_SECONDS:
+                    refresh_symbols()
                     send_calendar_snapshot(client)
                     send_position_snapshot(client)
                     send_sizing_inputs(client)
+                    send_scanner_candles(client)
                     last_risk_snapshot = now_mono
 
             except Exception:

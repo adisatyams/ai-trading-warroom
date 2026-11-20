@@ -34,8 +34,9 @@ function candidate(
   overrides: Partial<SizingCandidate> = {}
 ): SizingCandidate {
   return {
-    signal_id: `${STRATEGY}:EURUSD:${ISO_NOW}`,
+    signal_id: `${STRATEGY}:EURUSD:M15:${ISO_NOW}`,
     symbol: "EURUSD",
+    timeframe: "M15",
     strategy: STRATEGY,
     strategy_version: STRATEGY_VERSION,
     state: "BUY",
@@ -70,6 +71,7 @@ function input(
       spec: {
         tick_size: 0.1,
         tick_value_loss: 1,
+        contract_size: 100_000,
         volume_min: 0.1,
         volume_max: 100,
         volume_step: 0.1
@@ -101,10 +103,13 @@ test("sizes a BUY from a 2x ATR stop within the 0.25% equity risk budget", () =>
   const result = sizePosition(candidate(), input());
   assert.equal(result.decision, "SIZED_FOR_PAPER_REVIEW");
   assert.equal(result.direction, "BUY");
+  assert.equal(result.timeframe, "M15");
   assert.equal(result.metrics.atr14_m1, 1);
   assert.equal(result.metrics.entry_price, 100.1);
   assert.ok(Math.abs(result.metrics.stop_loss_price! - 98.1) < 1e-10);
+  assert.ok(Math.abs(result.metrics.take_profit_price! - 104.1) < 1e-10);
   assert.equal(result.metrics.risk_budget, 25);
+  assert.equal(result.metrics.contract_size, 100_000);
   assert.equal(result.metrics.volume, 1.2);
   assert.equal(result.metrics.estimated_loss, 24);
   assert.ok(result.metrics.estimated_risk_pct! <= 0.25);
@@ -120,6 +125,7 @@ test("uses bid and an upward stop for SELL signals", () => {
   assert.equal(result.direction, "SELL");
   assert.equal(result.metrics.entry_price, 100);
   assert.equal(result.metrics.stop_loss_price, 102);
+  assert.equal(result.metrics.take_profit_price, 96);
 });
 
 test("rejects stale inputs, non-eligible risk results, and unsafe execution mode", () => {
@@ -132,6 +138,7 @@ test("rejects stale inputs, non-eligible risk results, and unsafe execution mode
       spec: {
         tick_size: 0.1,
         tick_value_loss: 1,
+        contract_size: 100_000,
         volume_min: 0.1,
         volume_max: 100,
         volume_step: 0.1
@@ -176,6 +183,7 @@ test("rejects missing or gapped M1 history and invalid contract data", () => {
       spec: {
         tick_size: 0,
         tick_value_loss: 1,
+        contract_size: 100_000,
         volume_min: 0.1,
         volume_max: 100,
         volume_step: 0.1
@@ -209,6 +217,7 @@ test("rejects risk below broker minimum and never rounds volume up", () => {
         spec: {
           tick_size: 0.1,
           tick_value_loss: 1,
+          contract_size: 100_000,
           volume_min: 0.1,
           volume_max: 0.7,
           volume_step: 0.1

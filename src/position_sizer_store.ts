@@ -1,14 +1,19 @@
 import type { Env, SizingInputSymbol, SizingInputsPayload } from "./types";
+import type { DatabaseStatement } from "./postgres";
 import { agentStatusUpdate, tableColumns } from "./db_compat";
 import {
   DEFAULT_POSITION_SIZER_CONFIG,
   MAX_ALLOWED_RISK_PCT,
+  TAKE_PROFIT_R_MULTIPLE,
   sizePosition,
   type PositionSizerInput,
   type PositionSizerResult,
   type SizingCandidate
 } from "./position_sizer";
-import { STRATEGY, STRATEGY_VERSION } from "./scanner";
+import {
+  STRATEGY,
+  STRATEGY_VERSION
+} from "./scanner";
 
 const RESULT_RETENTION_DAYS = 14;
 
@@ -80,14 +85,21 @@ function isFresh(timestamp: string, nowMs: number, staleSeconds: number): boolea
 function saveResult(
   env: Env,
   result: PositionSizerResult
-): D1PreparedStatement {
+): DatabaseStatement {
   return env.DB.prepare(`
-    INSERT OR REPLACE INTO position_sizing_results
-      (signal_id, symbol, decision, checked_at, result_json)
-    VALUES (?, ?, ?, ?, ?)
+    INSERT INTO position_sizing_results
+      (signal_id, symbol, timeframe, decision, checked_at, result_json)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT (signal_id) DO UPDATE SET
+      symbol = EXCLUDED.symbol,
+      timeframe = EXCLUDED.timeframe,
+      decision = EXCLUDED.decision,
+      checked_at = EXCLUDED.checked_at,
+      result_json = EXCLUDED.result_json
   `).bind(
     result.signal_id,
     result.symbol,
+    result.timeframe,
     result.decision,
     result.checked_at,
     JSON.stringify(result)
@@ -107,28 +119,44 @@ export async function sizeEligibleSignals(
   const nowMs = Date.now();
   const config = positionSizerConfig(env);
   const results: PositionSizerResult[] = [];
-  let skippedRisk = 0;
-
-  for (const symbol of uniqueSymbols) {
-    const [riskRow, bridgeRow, quoteRow, inputRow] = await Promise.all([
-      env.DB.prepare(`
-        SELECT signal_id, symbol, strategy, strategy_version, scanner_state,
-               decision, as_of, checked_at
-        FROM risk_check_results
-        WHERE symbol = ?
-        ORDER BY checked_at DESC
-        LIMIT 1
-      `).bind(symbol).first<{
+  const symbolFilter = uniqueSymbols.map(() => "?").join(",");
+  const riskRows = uniqueSymbols.length
+    ? (await env.DB.prepare(`
+        SELECT current.signal_id, current.symbol, current.strategy,
+               current.strategy_version, current.scanner_state,
+               current.timeframe, current.decision, current.as_of,
+               current.checked_at
+        FROM risk_check_results current
+        JOIN (
+          SELECT symbol, timeframe, MAX(checked_at) AS latest_checked_at
+          FROM risk_check_results
+          WHERE symbol IN (${symbolFilter})
+            AND timeframe IN ('M5', 'M15', 'H1', 'H4')
+          GROUP BY symbol, timeframe
+        ) newest
+          ON newest.symbol = current.symbol
+          AND newest.timeframe = current.timeframe
+          AND newest.latest_checked_at = current.checked_at
+      `).bind(...uniqueSymbols).all<{
         signal_id: string;
         symbol: string;
         strategy: string;
         strategy_version: string;
         scanner_state: string;
+        timeframe: SizingCandidate["timeframe"];
         decision: string;
         as_of: string | null;
         checked_at: string;
-      }>(),
-      env.DB.prepare(`
+      }>()).results
+    : [];
+  const eligibleRiskRows = riskRows.filter(
+    (row): row is NonNullable<typeof row> => row !== null &&
+    row.decision === "ELIGIBLE_FOR_PAPER_REVIEW" &&
+    isFresh(row.checked_at, nowMs, config.staleSeconds)
+  );
+  const skippedRisk = riskRows.length - eligibleRiskRows.length;
+  const bridgeRow = eligibleRiskRows.length
+    ? await env.DB.prepare(`
         SELECT connected, trade_mode, equity, received_at
         FROM bridge_heartbeats
         ORDER BY id DESC
@@ -138,43 +166,49 @@ export async function sizeEligibleSignals(
         trade_mode: number | string;
         equity: number | null;
         received_at: string;
-      }>(),
-      env.DB.prepare(`
-        SELECT bid, ask, received_at
-        FROM market_observations
-        WHERE symbol = ?
-        ORDER BY received_at DESC
-        LIMIT 1
-      `).bind(symbol).first<{
-        bid: number;
-        ask: number;
-        received_at: string;
-      }>(),
-      env.DB.prepare(`
-        SELECT captured_at, received_at, available, input_json
-        FROM position_sizing_inputs
-        WHERE symbol = ?
-        LIMIT 1
-      `).bind(symbol).first<{
-        captured_at: string;
-        received_at: string;
-        available: number;
-        input_json: string;
       }>()
-    ]);
+    : null;
 
-    if (
-      !riskRow ||
-      riskRow.decision !== "ELIGIBLE_FOR_PAPER_REVIEW" ||
-      !isFresh(riskRow.checked_at, nowMs, config.staleSeconds)
-    ) {
-      skippedRisk++;
-      continue;
-    }
+  const eligibleSymbols = [...new Set(
+    eligibleRiskRows.map(row => row.symbol)
+  )];
+  const eligibleSymbolFilter = eligibleSymbols.map(() => "?").join(",");
+  const [quoteRows, inputRows] = eligibleSymbols.length
+    ? await Promise.all([
+        env.DB.prepare(`
+          SELECT symbol, bid, ask, received_at
+          FROM market_observation_latest
+          WHERE symbol IN (${eligibleSymbolFilter})
+        `).bind(...eligibleSymbols).all<{
+          symbol: string;
+          bid: number;
+          ask: number;
+          received_at: string;
+        }>(),
+        env.DB.prepare(`
+          SELECT symbol, captured_at, received_at, available, input_json
+          FROM position_sizing_inputs
+          WHERE symbol IN (${eligibleSymbolFilter})
+        `).bind(...eligibleSymbols).all<{
+          symbol: string;
+          captured_at: string;
+          received_at: string;
+          available: number;
+          input_json: string;
+        }>()
+      ])
+    : [{ results: [] }, { results: [] }];
+  const quoteBySymbol = new Map(quoteRows.results.map(row => [row.symbol, row]));
+  const inputBySymbol = new Map(inputRows.results.map(row => [row.symbol, row]));
+
+  for (const riskRow of eligibleRiskRows) {
+    const quoteRow = quoteBySymbol.get(riskRow.symbol);
+    const inputRow = inputBySymbol.get(riskRow.symbol);
 
     const candidate: SizingCandidate = {
       signal_id: riskRow.signal_id,
       symbol: riskRow.symbol,
+      timeframe: riskRow.timeframe,
       strategy: riskRow.strategy,
       strategy_version: riskRow.strategy_version,
       state: riskRow.scanner_state,
@@ -230,7 +264,7 @@ export async function sizeEligibleSignals(
     "SIZER",
     new Date(nowMs).toISOString(),
     STRATEGY,
-    `${STRATEGY} v${STRATEGY_VERSION}: M1 ATR(14), stop 2x ATR, max ${MAX_ALLOWED_RISK_PCT}% equity risk; no order path`
+    `${STRATEGY} v${STRATEGY_VERSION}: M1 ATR(14), stop 2x ATR, TP ${TAKE_PROFIT_R_MULTIPLE}R, max ${MAX_ALLOWED_RISK_PCT}% equity risk; no order path`
   );
   if (statusUpdate) {
     await env.DB.prepare(statusUpdate.sql)
@@ -250,13 +284,17 @@ export async function sizeEligibleSignals(
 
 export async function latestPositionSizes(
   env: Env,
-  filter: { symbol?: string; decision?: string } = {}
+  filter: { symbol?: string; timeframe?: string; decision?: string } = {}
 ): Promise<LatestPositionSize[]> {
-  const conditions: string[] = [];
+  const conditions: string[] = ["r.timeframe IN ('M5', 'M15', 'H1', 'H4')"];
   const values: string[] = [];
   if (filter.symbol) {
     conditions.push("r.symbol = ?");
     values.push(filter.symbol);
+  }
+  if (filter.timeframe) {
+    conditions.push("r.timeframe = ?");
+    values.push(filter.timeframe);
   }
   if (filter.decision) {
     conditions.push("r.decision = ?");
@@ -266,14 +304,15 @@ export async function latestPositionSizes(
     SELECT r.result_json, r.checked_at
     FROM position_sizing_results r
     JOIN (
-      SELECT symbol, MAX(checked_at) AS latest_checked_at
+      SELECT symbol, timeframe, MAX(checked_at) AS latest_checked_at
       FROM position_sizing_results
-      GROUP BY symbol
+      GROUP BY symbol, timeframe
     ) newest
       ON newest.symbol = r.symbol
+      AND newest.timeframe = r.timeframe
       AND newest.latest_checked_at = r.checked_at
     ${conditions.length ? `WHERE ${conditions.join(" AND ")}` : ""}
-    ORDER BY r.symbol
+    ORDER BY r.symbol, r.timeframe
   `).bind(...values).all<{ result_json: string; checked_at: string }>();
   const config = positionSizerConfig(env);
   const nowMs = Date.now();
@@ -319,6 +358,7 @@ export async function positionSizerStatus(env: Env) {
       atr_timeframe: "M1",
       atr_period: DEFAULT_POSITION_SIZER_CONFIG.atrPeriod,
       stop_atr_multiple: DEFAULT_POSITION_SIZER_CONFIG.stopAtrMultiple,
+      take_profit_r_multiple: TAKE_PROFIT_R_MULTIPLE,
       execution_enabled: false
     },
     config_valid: config.valid,

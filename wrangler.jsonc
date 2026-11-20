@@ -3,20 +3,19 @@
   "name": "ai-trading-warroom-api",
   "main": "src/index.ts",
   "compatibility_date": "2026-11-17",
+  "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
+  "hyperdrive": [
+    {
+      "binding": "HYPERDRIVE",
+      "id": "3064013c467b4fd6b91673ab91851179"
+    }
+  ],
   "assets": {
     "directory": "./public",
     "binding": "ASSETS",
     "run_worker_first": ["/api/*", "/ws/*"]
   },
-  "d1_databases": [
-    {
-      "binding": "DB",
-      "database_name": "warroom-db",
-      "database_id": "99108f21-2896-4d9f-a6f9-f8ea0cf0d24f",
-      "migrations_dir": "migrations"
-    }
-  ],
   "queues": {
     "producers": [
       { "binding": "MARKET_INGEST", "queue": "warroom-market-ingest" },

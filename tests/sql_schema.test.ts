@@ -42,6 +42,15 @@ test(
     for (const f of migrations) {
       db.exec(readFileSync(join(root, "migrations", f), "utf8"));
     }
+    db.exec(`
+      CREATE TABLE market_observation_latest (
+        symbol TEXT PRIMARY KEY,
+        bid REAL NOT NULL,
+        ask REAL NOT NULL,
+        tick_time TEXT,
+        received_at TEXT NOT NULL
+      )
+    `);
     // Legacy databases may contain an instruments table referenced by
     // market_latest; include it when validating compatibility queries.
     db.exec("CREATE TABLE instruments (symbol TEXT PRIMARY KEY)");
@@ -53,6 +62,7 @@ test(
     for (const f of files) {
       const statements = extractSql(readFileSync(join(root, "src", f), "utf8"));
       for (const sql of statements) {
+        if (sql.includes("information_schema.columns")) continue;
         checked++;
         try {
           db.prepare(sql);

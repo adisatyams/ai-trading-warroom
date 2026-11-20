@@ -28,8 +28,9 @@ function candidate(
   overrides: Partial<RiskCandidate> = {}
 ): RiskCandidate {
   return {
-    signal_id: `${STRATEGY}:EURUSD:${ISO_NOW}`,
+    signal_id: `${STRATEGY}:EURUSD:M15:${ISO_NOW}`,
     symbol: "EURUSD",
+    timeframe: "M15",
     strategy: STRATEGY,
     strategy_version: STRATEGY_VERSION,
     state: "BUY",
@@ -74,6 +75,7 @@ function context(overrides: Partial<RiskContext> = {}): RiskContext {
 test("eligible output is limited to paper review and requires all fresh inputs", () => {
   const result = evaluateRisk(candidate(), context());
   assert.equal(result.decision, "ELIGIBLE_FOR_PAPER_REVIEW");
+  assert.equal(result.timeframe, "M15");
   assert.deepEqual(result.reasons, []);
   assert.equal(result.execution_enabled, false);
   assert.ok(Object.values(result.checks).every(Boolean));
@@ -86,6 +88,18 @@ test("rejects a spread above the symbol limit", () => {
   );
   assert.equal(result.decision, "REJECTED");
   assert.equal(result.checks.spread, false);
+});
+
+test("rejects a scanner result older than its timeframe freshness window", () => {
+  const result = evaluateRisk(
+    candidate({
+      timeframe: "M5",
+      as_of: new Date(NOW - 601_000).toISOString()
+    }),
+    context()
+  );
+  assert.equal(result.checks.signal_freshness, false);
+  assert.equal(result.decision, "REJECTED");
 });
 
 test("uses a prefix spread limit for broker-suffixed symbols", () => {
