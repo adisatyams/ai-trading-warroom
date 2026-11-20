@@ -5,7 +5,10 @@
 // by the (not yet built) Risk Engine / AI gateway.
 
 import type { Env, Tick } from "./types";
-import { tableColumns } from "./db_compat";
+import {
+  scannerAgentStatusUpdate,
+  tableColumns
+} from "./db_compat";
 import {
   DEFAULT_CONFIG,
   STRATEGY,
@@ -140,21 +143,15 @@ export async function recordAndScan(
   if (resultStatements.length) {
     // Keep the dashboard's Agent Registry truthful about the scanner.
     // No-op if the SCANNER row does not exist.
-    const agentColumns = await tableColumns(env.DB, "agent_status");
-    if (
-      agentColumns.has("agent_name") &&
-      agentColumns.has("last_seen_at") &&
-      agentColumns.has("detail")
-    ) {
+    const statusUpdate = scannerAgentStatusUpdate(
+      await tableColumns(env.DB, "agent_status"),
+      new Date().toISOString(),
+      STRATEGY,
+      `${STRATEGY} v${STRATEGY_VERSION}: research candidates only, no order path`
+    );
+    if (statusUpdate) {
       resultStatements.push(
-        env.DB.prepare(`
-          UPDATE agent_status
-          SET status = 'READY', last_seen_at = ?, detail = ?
-          WHERE agent_name = 'SCANNER'
-        `).bind(
-          new Date().toISOString(),
-          `${STRATEGY} v${STRATEGY_VERSION}: research candidates only, no order path`
-        )
+        env.DB.prepare(statusUpdate.sql).bind(...statusUpdate.values)
       );
     }
     await env.DB.batch(resultStatements);

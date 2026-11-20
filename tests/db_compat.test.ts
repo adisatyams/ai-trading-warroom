@@ -4,6 +4,7 @@ import {
   agentStatusSelect,
   marketLatestSelect,
   marketLatestUpsert,
+  scannerAgentStatusUpdate,
   systemEventInsert
 } from "../src/db_compat.ts";
 
@@ -166,5 +167,64 @@ test(
       db.prepare("SELECT payload_json FROM system_events").get().payload_json,
       event.payload
     );
+  }
+);
+
+test(
+  "scanner processing marks the matching legacy or current agent row active",
+  { skip: DatabaseSync ? false : "node:sqlite unavailable" },
+  () => {
+    const db = new DatabaseSync(":memory:");
+    db.exec(`
+      CREATE TABLE agent_status (
+        agent_id TEXT PRIMARY KEY,
+        status TEXT NOT NULL DEFAULT 'idle',
+        last_heartbeat TEXT,
+        strategy_name TEXT,
+        metadata TEXT,
+        error_message TEXT
+      );
+      INSERT INTO agent_status(agent_id) VALUES ('SCANNER');
+    `);
+    const legacy = scannerAgentStatusUpdate(
+      columns(db, "agent_status"),
+      "2026-11-20T03:00:00Z",
+      "SNAPSHOT_MOMENTUM_V1",
+      "research candidates only"
+    );
+    assert.ok(legacy);
+    db.prepare(legacy.sql).run(...legacy.values);
+    const legacyRow = db.prepare(
+      "SELECT status, last_heartbeat, strategy_name, metadata FROM agent_status"
+    ).get();
+    assert.equal(legacyRow.status, "running");
+    assert.equal(legacyRow.last_heartbeat, "2026-11-20T03:00:00Z");
+    assert.equal(legacyRow.strategy_name, "SNAPSHOT_MOMENTUM_V1");
+    assert.equal(JSON.parse(legacyRow.metadata).execution_enabled, false);
+
+    db.exec("DROP TABLE agent_status");
+    db.exec(`
+      CREATE TABLE agent_status (
+        agent_name TEXT PRIMARY KEY,
+        status TEXT NOT NULL,
+        last_seen_at TEXT,
+        detail TEXT
+      );
+      INSERT INTO agent_status(agent_name, status) VALUES ('SCANNER', 'IDLE');
+    `);
+    const current = scannerAgentStatusUpdate(
+      columns(db, "agent_status"),
+      "2026-11-20T03:01:00Z",
+      "SNAPSHOT_MOMENTUM_V1",
+      "research candidates only"
+    );
+    assert.ok(current);
+    db.prepare(current.sql).run(...current.values);
+    const currentRow = db.prepare(
+      "SELECT status, last_seen_at, detail FROM agent_status"
+    ).get();
+    assert.equal(currentRow.status, "READY");
+    assert.equal(currentRow.last_seen_at, "2026-11-20T03:01:00Z");
+    assert.equal(currentRow.detail, "research candidates only");
   }
 );

@@ -124,6 +124,61 @@ export function marketLatestUpsert(
   };
 }
 
+export function scannerAgentStatusUpdate(
+  columns: Set<string>,
+  timestamp: string,
+  strategy: string,
+  detail: string
+): { sql: string; values: unknown[] } | null {
+  if (
+    columns.has("agent_name") &&
+    columns.has("last_seen_at") &&
+    columns.has("detail") &&
+    columns.has("status")
+  ) {
+    return {
+      sql: `
+        UPDATE agent_status
+        SET status = 'READY', last_seen_at = ?, detail = ?
+        WHERE agent_name = 'SCANNER'
+      `,
+      values: [timestamp, detail]
+    };
+  }
+
+  if (
+    !columns.has("agent_id") ||
+    !columns.has("last_heartbeat") ||
+    !columns.has("status")
+  ) {
+    return null;
+  }
+
+  const assignments = ["status = 'running'", "last_heartbeat = ?"];
+  const values: unknown[] = [timestamp];
+  if (columns.has("strategy_name")) {
+    assignments.push("strategy_name = ?");
+    values.push(strategy);
+  }
+  if (columns.has("metadata")) {
+    assignments.push("metadata = ?");
+    values.push(JSON.stringify({ detail, execution_enabled: false }));
+  }
+  if (columns.has("error_message")) {
+    assignments.push("error_message = NULL");
+  }
+  values.push("SCANNER");
+
+  return {
+    sql: `
+      UPDATE agent_status
+      SET ${assignments.join(", ")}
+      WHERE agent_id = ?
+    `,
+    values
+  };
+}
+
 export async function insertSystemEvent(
   db: D1Database,
   event: {
