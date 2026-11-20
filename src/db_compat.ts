@@ -124,8 +124,9 @@ export function marketLatestUpsert(
   };
 }
 
-export function scannerAgentStatusUpdate(
+export function agentStatusUpdate(
   columns: Set<string>,
+  agentName: string,
   timestamp: string,
   strategy: string,
   detail: string
@@ -138,11 +139,14 @@ export function scannerAgentStatusUpdate(
   ) {
     return {
       sql: `
-        UPDATE agent_status
-        SET status = 'READY', last_seen_at = ?, detail = ?
-        WHERE agent_name = 'SCANNER'
+        INSERT INTO agent_status (agent_name, status, last_seen_at, detail)
+        VALUES (?, 'READY', ?, ?)
+        ON CONFLICT(agent_name) DO UPDATE SET
+          status = 'READY',
+          last_seen_at = excluded.last_seen_at,
+          detail = excluded.detail
       `,
-      values: [timestamp, detail]
+      values: [agentName, timestamp, detail]
     };
   }
 
@@ -154,29 +158,43 @@ export function scannerAgentStatusUpdate(
     return null;
   }
 
-  const assignments = ["status = 'running'", "last_heartbeat = ?"];
-  const values: unknown[] = [timestamp];
+  const insertColumns = ["agent_id", "status", "last_heartbeat"];
+  const insertValues: unknown[] = [agentName, "running", timestamp];
+  const updateColumns = ["status", "last_heartbeat"];
   if (columns.has("strategy_name")) {
-    assignments.push("strategy_name = ?");
-    values.push(strategy);
+    insertColumns.push("strategy_name");
+    insertValues.push(strategy);
+    updateColumns.push("strategy_name");
   }
   if (columns.has("metadata")) {
-    assignments.push("metadata = ?");
-    values.push(JSON.stringify({ detail, execution_enabled: false }));
+    insertColumns.push("metadata");
+    insertValues.push(JSON.stringify({ detail, execution_enabled: false }));
+    updateColumns.push("metadata");
   }
   if (columns.has("error_message")) {
-    assignments.push("error_message = NULL");
+    insertColumns.push("error_message");
+    insertValues.push(null);
+    updateColumns.push("error_message");
   }
-  values.push("SCANNER");
 
   return {
     sql: `
-      UPDATE agent_status
-      SET ${assignments.join(", ")}
-      WHERE agent_id = ?
+      INSERT INTO agent_status (${insertColumns.join(", ")})
+      VALUES (${insertColumns.map(() => "?").join(", ")})
+      ON CONFLICT(agent_id) DO UPDATE SET
+        ${updateColumns.map(column => `${column} = excluded.${column}`).join(", ")}
     `,
-    values
+    values: insertValues
   };
+}
+
+export function scannerAgentStatusUpdate(
+  columns: Set<string>,
+  timestamp: string,
+  strategy: string,
+  detail: string
+): { sql: string; values: unknown[] } | null {
+  return agentStatusUpdate(columns, "SCANNER", timestamp, strategy, detail);
 }
 
 export async function insertSystemEvent(

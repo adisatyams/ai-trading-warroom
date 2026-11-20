@@ -78,7 +78,12 @@ export async function recordAndScan(
   env: Env,
   items: IngestedTick[],
   fallbackReceivedAt: string
-): Promise<{ observations: number; evaluated: number; rejected_ticks: number }> {
+): Promise<{
+  observations: number;
+  evaluated: number;
+  rejected_ticks: number;
+  symbols: string[];
+}> {
   const config = scannerConfig(env);
   const statements: D1PreparedStatement[] = [];
   const symbols = new Set<string>();
@@ -142,7 +147,6 @@ export async function recordAndScan(
 
   if (resultStatements.length) {
     // Keep the dashboard's Agent Registry truthful about the scanner.
-    // No-op if the SCANNER row does not exist.
     const statusUpdate = scannerAgentStatusUpdate(
       await tableColumns(env.DB, "agent_status"),
       new Date().toISOString(),
@@ -160,7 +164,8 @@ export async function recordAndScan(
   return {
     observations,
     evaluated: symbols.size,
-    rejected_ticks: rejectedTicks
+    rejected_ticks: rejectedTicks,
+    symbols: [...symbols]
   };
 }
 

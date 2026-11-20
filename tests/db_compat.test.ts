@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   agentStatusSelect,
+  agentStatusUpdate,
   marketLatestSelect,
   marketLatestUpsert,
   scannerAgentStatusUpdate,
@@ -226,5 +227,66 @@ test(
     assert.equal(currentRow.status, "READY");
     assert.equal(currentRow.last_seen_at, "2026-11-20T03:01:00Z");
     assert.equal(currentRow.detail, "research candidates only");
+    db.close();
+  }
+);
+
+test(
+  "risk-check status creates a registry row in either schema",
+  { skip: DatabaseSync ? false : "node:sqlite unavailable" },
+  () => {
+    const db = new DatabaseSync(":memory:");
+    db.exec(`
+      CREATE TABLE agent_status (
+        agent_name TEXT PRIMARY KEY,
+        status TEXT NOT NULL DEFAULT 'IDLE',
+        last_seen_at TEXT,
+        detail TEXT
+      );
+    `);
+    const current = agentStatusUpdate(
+      columns(db, "agent_status"),
+      "RISK_CHECK",
+      "2026-11-20T03:02:00Z",
+      "SNAPSHOT_MOMENTUM_V1",
+      "fail-closed screening only"
+    );
+    assert.ok(current);
+    db.prepare(current.sql).run(...current.values);
+    const currentRow = db.prepare(
+      "SELECT agent_name, status, detail FROM agent_status"
+    ).get();
+    assert.equal(currentRow.agent_name, "RISK_CHECK");
+    assert.equal(currentRow.status, "READY");
+    assert.equal(currentRow.detail, "fail-closed screening only");
+
+    db.exec("DROP TABLE agent_status");
+    db.exec(`
+      CREATE TABLE agent_status (
+        agent_id TEXT PRIMARY KEY,
+        status TEXT NOT NULL DEFAULT 'idle',
+        last_heartbeat TEXT,
+        strategy_name TEXT,
+        metadata TEXT,
+        error_message TEXT
+      );
+    `);
+    const legacy = agentStatusUpdate(
+      columns(db, "agent_status"),
+      "RISK_CHECK",
+      "2026-11-20T03:03:00Z",
+      "SNAPSHOT_MOMENTUM_V1",
+      "fail-closed screening only"
+    );
+    assert.ok(legacy);
+    db.prepare(legacy.sql).run(...legacy.values);
+    const legacyRow = db.prepare(
+      "SELECT agent_id, status, strategy_name, metadata FROM agent_status"
+    ).get();
+    assert.equal(legacyRow.agent_id, "RISK_CHECK");
+    assert.equal(legacyRow.status, "running");
+    assert.equal(legacyRow.strategy_name, "SNAPSHOT_MOMENTUM_V1");
+    assert.equal(JSON.parse(legacyRow.metadata).execution_enabled, false);
+    db.close();
   }
 );
