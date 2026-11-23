@@ -1,5 +1,6 @@
 import type { Env } from "./types";
-import { agentStatusUpdate, tableColumns } from "./db_compat";
+import type { DatabaseStatement } from "./postgres";
+import { agentStatusUpdate, tableColumns } from "./db_compat.ts";
 import {
   DEFAULT_RISK_CONFIG,
   evaluateRisk,
@@ -9,9 +10,9 @@ import {
   type RiskContext,
   type RiskConfig,
   type RiskResult
-} from "./risk_checker";
-import type { Observation } from "./scanner";
-import { STRATEGY, STRATEGY_VERSION } from "./scanner";
+} from "./risk_checker.ts";
+import type { Observation } from "./scanner.ts";
+import { STRATEGY, STRATEGY_VERSION } from "./scanner.ts";
 
 const RISK_RESULT_RETENTION_DAYS = 14;
 const POSITION_RETENTION_HOURS = 48;
@@ -34,6 +35,20 @@ export function riskConfig(env: Env): RiskConfig {
   const stale = Number(env.BRIDGE_STALE_SECONDS);
   const dailyLoss = Number(env.MAX_DAILY_LOSS_PCT);
   const drawdown = Number(env.MAX_DRAWDOWN_PCT);
+  if (
+    env.MAX_DAILY_LOSS_PCT !== undefined &&
+    env.MAX_DAILY_LOSS_PCT !== "" &&
+    (!Number.isFinite(dailyLoss) || dailyLoss <= 0)
+  ) {
+    throw new Error("MAX_DAILY_LOSS_PCT must be positive");
+  }
+  if (
+    env.MAX_DRAWDOWN_PCT !== undefined &&
+    env.MAX_DRAWDOWN_PCT !== "" &&
+    (!Number.isFinite(drawdown) || drawdown <= 0)
+  ) {
+    throw new Error("MAX_DRAWDOWN_PCT must be positive");
+  }
   return {
     ...DEFAULT_RISK_CONFIG,
     staleSeconds:
@@ -63,9 +78,10 @@ export async function saveNewsCalendar(
 
   for (const event of events) {
     statements.push(env.DB.prepare(`
-      INSERT OR IGNORE INTO news_calendar_events
+      INSERT INTO news_calendar_events
         (event_id, currency, name, importance, scheduled_at)
       VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT (event_id, currency, scheduled_at) DO NOTHING
     `).bind(
       event.event_id,
       event.currency,
@@ -76,9 +92,15 @@ export async function saveNewsCalendar(
   }
 
   statements.push(env.DB.prepare(`
-    INSERT OR REPLACE INTO news_calendar_sync
+    INSERT INTO news_calendar_sync
       (id, available, source_generated_at, received_at, event_count, error)
     VALUES (1, ?, ?, ?, ?, ?)
+    ON CONFLICT (id) DO UPDATE SET
+      available = EXCLUDED.available,
+      source_generated_at = EXCLUDED.source_generated_at,
+      received_at = EXCLUDED.received_at,
+      event_count = EXCLUDED.event_count,
+      error = EXCLUDED.error
   `).bind(
     batch.available ? 1 : 0,
     batch.generated_at,
@@ -119,6 +141,38 @@ export async function savePositionSnapshot(
     ));
   }
 
+  const snapshotAgeMs = Date.now() - Date.parse(batch.captured_at);
+  if (snapshotAgeMs >= 0 && snapshotAgeMs <= riskConfig(env).staleSeconds * 1000) {
+    const closeEligibleBefore = new Date(
+      Date.parse(batch.captured_at) - 60_000
+    ).toISOString();
+    statements.push(env.DB.prepare(`
+      UPDATE trade_intents
+      SET status = 'CLOSED'
+      WHERE status IN ('EXECUTED', 'PARTIAL')
+        AND intent_id IN (
+          SELECT trade_id
+          FROM trade_history
+          WHERE opened_at IS NOT NULL AND opened_at <= ?
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM risk_open_positions
+          WHERE snapshot_id = ? AND symbol = trade_intents.symbol
+        )
+    `).bind(closeEligibleBefore, snapshotId));
+    statements.push(env.DB.prepare(`
+      UPDATE trade_history
+      SET status = 'CLOSED', closed_at = ?
+      WHERE closed_at IS NULL
+        AND trade_id IN (
+          SELECT intent_id
+          FROM trade_intents
+          WHERE status = 'CLOSED'
+        )
+    `).bind(batch.captured_at));
+  }
+
   await env.DB.batch(statements);
   return { snapshot_id: snapshotId, positions: batch.positions.length };
 }
@@ -127,6 +181,7 @@ function parseRiskRow(row: any): RiskResult {
   return {
     signal_id: row.signal_id,
     symbol: row.symbol,
+    timeframe: row.timeframe,
     strategy: row.strategy,
     strategy_version: row.strategy_version,
     scanner_state: row.scanner_state,
@@ -142,9 +197,8 @@ function parseRiskRow(row: any): RiskResult {
 
 async function riskContext(
   env: Env,
-  symbol: string,
   nowMs: number
-): Promise<RiskContext> {
+): Promise<Omit<RiskContext, "observations">> {
   const config = riskConfig(env);
   const dayStart = new Date(nowMs);
   dayStart.setUTCHours(0, 0, 0, 0);
@@ -152,7 +206,6 @@ async function riskContext(
 
   const [
     bridgeRow,
-    observations,
     calendar,
     calendarEvents,
     snapshot,
@@ -164,13 +217,6 @@ async function riskContext(
       ORDER BY id DESC
       LIMIT 1
     `).first<{ connected: number; trade_mode: number | string; received_at: string }>(),
-    env.DB.prepare(`
-      SELECT symbol, bid, ask, tick_time, received_at
-      FROM market_observations
-      WHERE symbol = ?
-      ORDER BY received_at DESC
-      LIMIT ?
-    `).bind(symbol, 21).all<Observation>(),
     env.DB.prepare(`
       SELECT available, received_at
       FROM news_calendar_sync
@@ -240,7 +286,6 @@ async function riskContext(
           received_at: bridgeRow.received_at
         }
       : null,
-    observations: [...observations.results].reverse(),
     calendar: calendar
       ? { available: !!calendar.available, received_at: calendar.received_at }
       : null,
@@ -271,17 +316,30 @@ async function riskContext(
 function saveRiskResult(
   env: Env,
   result: RiskResult
-): D1PreparedStatement {
+): DatabaseStatement {
   return env.DB.prepare(`
-    INSERT OR REPLACE INTO risk_check_results
+    INSERT INTO risk_check_results
       (
-        signal_id, symbol, strategy, strategy_version, scanner_state,
+        signal_id, symbol, timeframe, strategy, strategy_version, scanner_state,
         decision, reasons_json, checks_json, metrics_json, as_of, checked_at
       )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT (signal_id) DO UPDATE SET
+      symbol = EXCLUDED.symbol,
+      timeframe = EXCLUDED.timeframe,
+      strategy = EXCLUDED.strategy,
+      strategy_version = EXCLUDED.strategy_version,
+      scanner_state = EXCLUDED.scanner_state,
+      decision = EXCLUDED.decision,
+      reasons_json = EXCLUDED.reasons_json,
+      checks_json = EXCLUDED.checks_json,
+      metrics_json = EXCLUDED.metrics_json,
+      as_of = EXCLUDED.as_of,
+      checked_at = EXCLUDED.checked_at
   `).bind(
     result.signal_id,
     result.symbol,
+    result.timeframe,
     result.strategy,
     result.strategy_version,
     result.scanner_state,
@@ -297,46 +355,83 @@ function saveRiskResult(
 export async function checkLatestSignals(
   env: Env,
   symbols: string[]
-): Promise<{ evaluated: number; eligible_for_paper_review: number; rejected: number }> {
+): Promise<{
+  evaluated: number;
+  eligible_for_paper_review: number;
+  eligible_for_demo_execution: number;
+  rejected: number;
+}> {
   const uniqueSymbols = [...new Set(symbols)];
   const results: RiskResult[] = [];
   const nowMs = Date.now();
   const config = riskConfig(env);
-
-  for (const symbol of uniqueSymbols) {
-    const row = await env.DB.prepare(`
-      SELECT signal_id, symbol, strategy, strategy_version, state, as_of,
-             features_json
-      FROM scanner_results
-      WHERE symbol = ?
-      ORDER BY as_of DESC
-      LIMIT 1
-    `).bind(symbol).first<{
+  const symbolFilter = uniqueSymbols.map(() => "?").join(",");
+  const latestRows = uniqueSymbols.length
+    ? await env.DB.prepare(`
+        SELECT current.signal_id, current.symbol, current.timeframe,
+               current.strategy, current.strategy_version, current.state,
+               current.as_of, current.features_json
+        FROM scanner_results current
+        JOIN (
+          SELECT symbol, timeframe, MAX(as_of) AS latest_as_of
+          FROM scanner_results
+          WHERE symbol IN (${symbolFilter})
+            AND timeframe IN ('M5', 'M15', 'H1', 'H4')
+          GROUP BY symbol, timeframe
+        ) newest
+          ON newest.symbol = current.symbol
+          AND newest.timeframe = current.timeframe
+          AND newest.latest_as_of = current.as_of
+        ORDER BY current.symbol, current.timeframe
+      `).bind(...uniqueSymbols).all<{
       signal_id: string;
       symbol: string;
+      timeframe: RiskCandidate["timeframe"];
       strategy: string;
       strategy_version: string;
       state: string;
       as_of: string | null;
       features_json: string;
-    }>();
-    if (!row) continue;
+    }>()
+    : { results: [] };
+  const candidates = latestRows.results.map(row => ({
+    signal_id: row.signal_id,
+    symbol: row.symbol,
+    timeframe: row.timeframe,
+    strategy: row.strategy,
+    strategy_version: row.strategy_version,
+    state: row.state,
+    as_of: row.as_of,
+    features: JSON.parse(row.features_json)
+  } satisfies RiskCandidate));
 
-    const candidate: RiskCandidate = {
-      signal_id: row.signal_id,
-      symbol: row.symbol,
-      strategy: row.strategy,
-      strategy_version: row.strategy_version,
-      state: row.state,
-      as_of: row.as_of,
-      features: JSON.parse(row.features_json)
-    };
-    const result = evaluateRisk(
-      candidate,
-      await riskContext(env, symbol, nowMs),
-      config
-    );
-    results.push(result);
+  if (candidates.length) {
+    const sharedContext = await riskContext(env, nowMs);
+    const observationsBySymbol = new Map<string, Observation[]>();
+    const observationRows = await env.DB.prepare(`
+      SELECT symbol, bid, ask, tick_time, received_at
+      FROM (
+        SELECT symbol, bid, ask, tick_time, received_at,
+               ROW_NUMBER() OVER (
+                 PARTITION BY symbol ORDER BY received_at DESC
+               ) AS row_number
+        FROM market_observations
+        WHERE symbol IN (${symbolFilter})
+      ) recent
+      WHERE row_number <= 21
+      ORDER BY symbol, received_at
+    `).bind(...uniqueSymbols).all<Observation & { row_number?: number }>();
+    for (const row of observationRows.results) {
+      const current = observationsBySymbol.get(row.symbol) ?? [];
+      current.push(row);
+      observationsBySymbol.set(row.symbol, current);
+    }
+    results.push(...await Promise.all(candidates.map(async candidate => {
+      return evaluateRisk(candidate, {
+        ...sharedContext,
+        observations: observationsBySymbol.get(candidate.symbol) ?? []
+      }, config);
+    })));
   }
 
   if (results.length) {
@@ -361,19 +456,26 @@ export async function checkLatestSignals(
     eligible_for_paper_review: results.filter(
       result => result.decision === "ELIGIBLE_FOR_PAPER_REVIEW"
     ).length,
+    eligible_for_demo_execution: results.filter(
+      result => result.decision === "ELIGIBLE_FOR_DEMO_EXECUTION"
+    ).length,
     rejected: results.filter(result => result.decision === "REJECTED").length
   };
 }
 
 export async function latestRiskResults(
   env: Env,
-  filter: { symbol?: string; decision?: string } = {}
+  filter: { symbol?: string; timeframe?: string; decision?: string } = {}
 ): Promise<LatestRiskResult[]> {
-  const conditions: string[] = [];
+  const conditions: string[] = ["r.timeframe IN ('M5', 'M15', 'H1', 'H4')"];
   const values: string[] = [];
   if (filter.symbol) {
     conditions.push("r.symbol = ?");
     values.push(filter.symbol);
+  }
+  if (filter.timeframe) {
+    conditions.push("r.timeframe = ?");
+    values.push(filter.timeframe);
   }
   if (filter.decision) {
     conditions.push("r.decision = ?");
@@ -383,14 +485,15 @@ export async function latestRiskResults(
     SELECT r.*
     FROM risk_check_results r
     JOIN (
-      SELECT symbol, MAX(checked_at) AS latest_checked_at
+      SELECT symbol, timeframe, MAX(checked_at) AS latest_checked_at
       FROM risk_check_results
-      GROUP BY symbol
+      GROUP BY symbol, timeframe
     ) newest
       ON newest.symbol = r.symbol
+      AND newest.timeframe = r.timeframe
       AND newest.latest_checked_at = r.checked_at
     ${conditions.length ? `WHERE ${conditions.join(" AND ")}` : ""}
-    ORDER BY r.symbol
+    ORDER BY r.symbol, r.timeframe
   `).bind(...values).all<any>();
   const config = riskConfig(env);
   const nowMs = Date.now();
@@ -426,6 +529,7 @@ export async function riskStatus(env: Env) {
 
   const summary = {
     ELIGIBLE_FOR_PAPER_REVIEW: 0,
+    ELIGIBLE_FOR_DEMO_EXECUTION: 0,
     REJECTED: 0,
     STALE: 0
   };

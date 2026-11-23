@@ -1,14 +1,19 @@
 import {
   STRATEGY,
   STRATEGY_VERSION,
+  type ScannerTimeframe,
   type Observation
 } from "./scanner.ts";
 
-export type RiskDecision = "ELIGIBLE_FOR_PAPER_REVIEW" | "REJECTED";
+export type RiskDecision =
+  | "ELIGIBLE_FOR_PAPER_REVIEW"
+  | "ELIGIBLE_FOR_DEMO_EXECUTION"
+  | "REJECTED";
 
 export interface RiskCandidate {
   signal_id: string;
   symbol: string;
+  timeframe: ScannerTimeframe | "M1";
   strategy: string;
   strategy_version: string;
   state: string;
@@ -75,6 +80,7 @@ export interface RiskConfig {
 export interface RiskResult {
   signal_id: string;
   symbol: string;
+  timeframe: ScannerTimeframe | "M1";
   strategy: string;
   strategy_version: string;
   scanner_state: string;
@@ -82,6 +88,7 @@ export interface RiskResult {
   reasons: string[];
   checks: Record<string, boolean>;
   metrics: {
+    signal_age_seconds: number | null;
     spread_bps: number | null;
     max_spread_bps: number;
     latest_move_bps: number | null;
@@ -124,6 +131,13 @@ const KNOWN_SYMBOLS = [
 ];
 const MIN_VOLATILITY_OBSERVATIONS = 21;
 const MAX_DAILY_BASELINE_DELAY_SECONDS = 120;
+const TIMEFRAME_SECONDS: Record<string, number> = {
+  M1: 60,
+  M5: 300,
+  M15: 900,
+  H1: 3_600,
+  H4: 14_400
+};
 
 function median(values: number[]): number {
   const sorted = [...values].sort((a, b) => a - b);
@@ -245,6 +259,11 @@ export function evaluateRisk(
   let openPositionCount: number | null = null;
   let dailyLossPct: number | null = null;
   let dailyDrawdownPct: number | null = null;
+  const timeframeSeconds = TIMEFRAME_SECONDS[candidate.timeframe];
+  const signalAge =
+    candidate.as_of === null
+      ? null
+      : ageSeconds(candidate.as_of, context.nowMs);
 
   const reject = (check: string, reason: string) => {
     checks[check] = false;
@@ -265,8 +284,26 @@ export function evaluateRisk(
     pass("strategy");
   }
 
-  if (!context.paperMode || context.tradingEnabled) {
-    reject("safety", "Risk Checker requires PAPER_MODE=true and TRADING_ENABLED=false");
+  const signalFreshnessLimit = Math.max(
+    config.staleSeconds,
+    (timeframeSeconds ?? 60) * 2
+  );
+  if (
+    signalAge === null ||
+    !Number.isFinite(signalAge) ||
+    signalAge < 0 ||
+    signalAge > signalFreshnessLimit
+  ) {
+    reject(
+      "signal_freshness",
+      `Scanner signal is missing or stale (limit ${signalFreshnessLimit}s for ${candidate.timeframe})`
+    );
+  } else {
+    pass("signal_freshness");
+  }
+
+  if (!context.paperMode) {
+    reject("safety", "PAPER_MODE=true is required for demo execution");
   } else {
     pass("safety");
   }
@@ -419,15 +456,22 @@ export function evaluateRisk(
   return {
     signal_id: candidate.signal_id,
     symbol: candidate.symbol,
+    timeframe: candidate.timeframe,
     strategy: candidate.strategy,
     strategy_version: candidate.strategy_version,
     scanner_state: candidate.state,
     decision: reasons.length
       ? "REJECTED"
-      : "ELIGIBLE_FOR_PAPER_REVIEW",
+      : context.tradingEnabled
+        ? "ELIGIBLE_FOR_DEMO_EXECUTION"
+        : "ELIGIBLE_FOR_PAPER_REVIEW",
     reasons,
     checks,
     metrics: {
+      signal_age_seconds:
+        signalAge !== null && Number.isFinite(signalAge)
+          ? signalAge
+          : null,
       spread_bps:
         typeof spread === "number" && Number.isFinite(spread) ? spread : null,
       max_spread_bps: maxSpread,

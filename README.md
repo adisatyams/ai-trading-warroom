@@ -4,7 +4,7 @@ This is the Cloudflare-first Phase 1 starter. See `DEPLOYMENT.md` for deployment
 
 Cloudflare components:
 - Worker + Static Assets dashboard/API
-- D1 operational database
+- Aiven PostgreSQL operational database through Cloudflare Hyperdrive
 - Queues for market ingestion and agent task processing
 - R2 for raw market event archive
 - Durable Object for account control state
@@ -14,7 +14,7 @@ Windows VPS:
 - Exness MT5 Demo
 - Python telemetry bridge
 
-Deterministic scanner (`SNAPSHOT_MOMENTUM_V1`): rule-based candidate generation after market ingestion, results stored for audit and exposed at `/api/v1/scanner/*` (API key required). Research only.
+Deterministic multi-timeframe scanner (`MULTI_TIMEFRAME_INDICATORS_V1`): evaluates completed M5/M15/H1/H4 candles with EMA, MACD, RSI, ATR, and Bollinger/breakout scoring. Results are per symbol/timeframe and exposed at `/api/v1/scanner/*` (API key required). Research only; scores are heuristics, not probabilities.
 
 Development: `npm run typecheck` and `npm test`.
 

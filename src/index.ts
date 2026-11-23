@@ -5,6 +5,8 @@ import type {
   MarketBatch,
   NewsCalendarPayload,
   PositionSnapshotPayload,
+  ScannerCandlesPayload,
+  ScannerCandleSymbol,
   SizingInputsPayload,
   Tick
 } from "./types";
@@ -22,6 +24,7 @@ import {
   latestResults,
   pruneScanner,
   recordAndScan,
+  saveScannerCandles,
   scannerStatus
 } from "./scanner_store";
 import {
@@ -39,6 +42,20 @@ import {
   saveSizingInputs,
   sizeEligibleSignals
 } from "./position_sizer_store";
+import {
+  acknowledgeTradeIntent,
+  claimTradeIntents,
+  enqueueEligibleTrades,
+  executorStatus,
+  validExecutorAck
+} from "./executor";
+import {
+  loggerEvents,
+  recordClosedTrade,
+  validClosedTradeReport
+} from "./logger";
+import { equityStatus } from "./equity";
+import { postgresDatabase } from "./postgres";
 
 export { AccountCoordinator };
 
@@ -52,6 +69,22 @@ const AGENTS = [
 ];
 
 const now = () => new Date().toISOString();
+const validSymbol = (symbol: unknown): symbol is string =>
+  typeof symbol === "string" &&
+  symbol.trim().length > 0 &&
+  symbol.length <= 32 &&
+  !/[\u0000-\u001f]/.test(symbol);
+
+function withPostgres(env: Env): Env {
+  const connectionString = env.HYPERDRIVE?.connectionString;
+  if (!connectionString) {
+    throw new Error("PostgreSQL Hyperdrive binding is not configured");
+  }
+  return {
+    ...env,
+    DB: postgresDatabase(connectionString)
+  };
+}
 
 async function coordinator(env: Env) {
   const id = env.ACCOUNT_COORDINATOR.idFromName("exness-demo-primary");
@@ -62,6 +95,22 @@ async function requireAuth(request: Request, env: Env) {
   return authorized(request, env)
     ? null
     : json({ error: "Unauthorized" }, 401);
+}
+
+function executorAuthorized(request: Request, env: Env): Response | null {
+  if (!env.EXECUTOR_API_KEY) {
+    return json({ error: "Executor API key is not configured" }, 503);
+  }
+  const supplied = request.headers.get("x-executor-api-key") || "";
+  const expected = env.EXECUTOR_API_KEY;
+  if (supplied.length !== expected.length) {
+    return json({ error: "Unauthorized" }, 401);
+  }
+  let diff = 0;
+  for (let index = 0; index < supplied.length; index++) {
+    diff |= supplied.charCodeAt(index) ^ expected.charCodeAt(index);
+  }
+  return diff === 0 ? null : json({ error: "Unauthorized" }, 401);
 }
 
 export default {
@@ -75,18 +124,34 @@ export default {
 
     // HEALTH CHECK
     if (url.pathname === "/health") {
+      const workerExecutionEnabled =
+        env.TRADING_ENABLED === "true" &&
+        env.PAPER_MODE === "true";
       return json({
         ok: true,
         service: "AI Trading WarRoom Cloudflare",
         time: now(),
-        execution_enabled: false
+        execution_enabled: workerExecutionEnabled,
+        execution_scope: "DEMO_ONLY",
+        bridge_gate_required: true
       });
+    }
+
+    try {
+      env = withPostgres(env);
+    } catch (error) {
+      console.error("POSTGRES_CONFIGURATION_FAILURE", error);
+      return json({ error: "PostgreSQL database binding is unavailable" }, 503);
     }
 
     if (url.pathname.startsWith("/api/")) {
 
       // AUTHENTICATION FOR POST REQUESTS
-      if (request.method === "POST") {
+      const executorRoute =
+        url.pathname === "/api/v1/bridge/trade-commands" ||
+        url.pathname === "/api/v1/bridge/trade-commands/ack" ||
+        url.pathname === "/api/v1/bridge/trade-history/close";
+      if (request.method === "POST" && !executorRoute) {
         const denied = await requireAuth(request, env);
         if (denied) return denied;
       }
@@ -114,8 +179,15 @@ export default {
         if (denied) return denied;
 
         const symbol = url.searchParams.get("symbol") || undefined;
-        if (symbol && !/^[A-Za-z0-9._-]{1,32}$/.test(symbol)) {
+        const timeframe = url.searchParams.get("timeframe")?.toUpperCase();
+        if (symbol && !validSymbol(symbol)) {
           return json({ error: "Invalid symbol" }, 422);
+        }
+        if (
+          timeframe &&
+          !["M5", "M15", "H1", "H4"].includes(timeframe)
+        ) {
+          return json({ error: "timeframe must be M5, M15, H1, or H4" }, 422);
         }
 
         const stateParam = url.searchParams.get("state");
@@ -131,7 +203,7 @@ export default {
           }, 422);
         }
 
-        const items = await latestResults(env, { symbol, states });
+        const items = await latestResults(env, { symbol, timeframe, states });
         return json({
           items,
           count: items.length,
@@ -141,7 +213,7 @@ export default {
       }
 
       // =====================================================
-      // DETERMINISTIC RISK CHECKER (paper-review gate only)
+      // DETERMINISTIC RISK CHECKER (paper and demo-execution gate)
       // =====================================================
       if (
         url.pathname === "/api/v1/risk/status" &&
@@ -159,19 +231,34 @@ export default {
         const denied = await requireAuth(request, env);
         if (denied) return denied;
         const symbol = url.searchParams.get("symbol") || undefined;
-        if (symbol && !/^[A-Za-z0-9._-]{1,32}$/.test(symbol)) {
+        if (symbol && !validSymbol(symbol)) {
           return json({ error: "Invalid symbol" }, 422);
+        }
+        const timeframe = url.searchParams.get("timeframe")?.toUpperCase();
+        if (
+          timeframe &&
+          !["M5", "M15", "H1", "H4"].includes(timeframe)
+        ) {
+          return json({ error: "timeframe must be M5, M15, H1, or H4" }, 422);
         }
         const decision = url.searchParams.get("decision") || undefined;
         if (
           decision &&
-          !["ELIGIBLE_FOR_PAPER_REVIEW", "REJECTED"].includes(decision)
+          ![
+            "ELIGIBLE_FOR_PAPER_REVIEW",
+            "ELIGIBLE_FOR_DEMO_EXECUTION",
+            "REJECTED"
+          ].includes(decision)
         ) {
           return json({
-            error: "decision must be ELIGIBLE_FOR_PAPER_REVIEW or REJECTED"
+            error: "decision must be ELIGIBLE_FOR_PAPER_REVIEW, ELIGIBLE_FOR_DEMO_EXECUTION, or REJECTED"
           }, 422);
         }
-        const items = await latestRiskResults(env, { symbol, decision });
+        const items = await latestRiskResults(env, {
+          symbol,
+          timeframe,
+          decision
+        });
         return json({
           items,
           count: items.length,
@@ -181,7 +268,7 @@ export default {
       }
 
       // =====================================================
-      // POSITION SIZER (paper-review calculation only)
+      // POSITION SIZER (paper-review and demo-execution sizing only)
       // =====================================================
       if (
         url.pathname === "/api/v1/sizer/status" &&
@@ -199,25 +286,141 @@ export default {
         const denied = await requireAuth(request, env);
         if (denied) return denied;
         const symbol = url.searchParams.get("symbol") || undefined;
-        if (symbol && !/^[A-Za-z0-9._-]{1,32}$/.test(symbol)) {
+        if (symbol && !validSymbol(symbol)) {
           return json({ error: "Invalid symbol" }, 422);
+        }
+        const timeframe = url.searchParams.get("timeframe")?.toUpperCase();
+        if (
+          timeframe &&
+          !["M5", "M15", "H1", "H4"].includes(timeframe)
+        ) {
+          return json({ error: "timeframe must be M5, M15, H1, or H4" }, 422);
         }
         const decision = url.searchParams.get("decision") || undefined;
         if (
           decision &&
-          !["SIZED_FOR_PAPER_REVIEW", "REJECTED"].includes(decision)
+          ![
+            "SIZED_FOR_PAPER_REVIEW",
+            "SIZED_FOR_DEMO_EXECUTION",
+            "REJECTED"
+          ].includes(decision)
         ) {
           return json({
-            error: "decision must be SIZED_FOR_PAPER_REVIEW or REJECTED"
+            error: "decision must be SIZED_FOR_PAPER_REVIEW, SIZED_FOR_DEMO_EXECUTION, or REJECTED"
           }, 422);
         }
-        const items = await latestPositionSizes(env, { symbol, decision });
+        const items = await latestPositionSizes(env, {
+          symbol,
+          timeframe,
+          decision
+        });
         return json({
           items,
           count: items.length,
           advisory_only: true,
           execution_enabled: false
         });
+      }
+
+      if (
+        url.pathname === "/api/v1/executor/status" &&
+        request.method === "GET"
+      ) {
+        const denied = await requireAuth(request, env);
+        if (denied) return denied;
+        return json(await executorStatus(env));
+      }
+
+      if (
+        url.pathname === "/api/v1/logger/events" &&
+        request.method === "GET"
+      ) {
+        const denied = await requireAuth(request, env);
+        if (denied) return denied;
+        const rawLimit = url.searchParams.get("limit");
+        const limit = rawLimit === null ? 50 : Number(rawLimit);
+        if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+          return json({ error: "limit must be an integer from 1 to 100" }, 422);
+        }
+        const items = await loggerEvents(env.DB, limit);
+        return json({
+          agent: "LOGGER",
+          items,
+          count: items.length,
+          execution_enabled: false
+        });
+      }
+
+      if (
+        url.pathname === "/api/v1/equity/status" &&
+        request.method === "GET"
+      ) {
+        const denied = await requireAuth(request, env);
+        if (denied) return denied;
+        return json(await equityStatus(env.DB));
+      }
+
+      if (
+        url.pathname === "/api/v1/bridge/trade-commands" &&
+        request.method === "GET"
+      ) {
+        const denied = executorAuthorized(request, env);
+        if (denied) return denied;
+        const result = await claimTradeIntents(env);
+        return json({
+          ...result,
+          execution_enabled: !result.locked
+        });
+      }
+
+      if (
+        url.pathname === "/api/v1/bridge/trade-commands/ack" &&
+        request.method === "POST"
+      ) {
+        const denied = executorAuthorized(request, env);
+        if (denied) return denied;
+        let body: unknown;
+        try {
+          const bytes = await request.arrayBuffer();
+          if (bytes.byteLength > 16 * 1024) {
+            return json({ error: "Payload too large" }, 413);
+          }
+          body = JSON.parse(new TextDecoder().decode(bytes));
+        } catch {
+          return json({ error: "Invalid JSON" }, 400);
+        }
+        if (!validExecutorAck(body)) {
+          return json({ error: "Invalid executor acknowledgement" }, 422);
+        }
+        const result = await acknowledgeTradeIntent(env, body);
+        return result.accepted
+          ? json({ ...result, execution_enabled: false })
+          : json({ error: "Unknown or conflicting trade intent" }, 409);
+      }
+
+      if (
+        url.pathname === "/api/v1/bridge/trade-history/close" &&
+        request.method === "POST"
+      ) {
+        const denied = executorAuthorized(request, env);
+        if (denied) return denied;
+        let body: unknown;
+        try {
+          const bytes = await request.arrayBuffer();
+          if (bytes.byteLength > 16 * 1024) {
+            return json({ error: "Payload too large" }, 413);
+          }
+          body = JSON.parse(new TextDecoder().decode(bytes));
+        } catch {
+          return json({ error: "Invalid JSON" }, 400);
+        }
+        if (!validClosedTradeReport(body)) {
+          return json({ error: "Invalid closed trade report" }, 422);
+        }
+        const result = await recordClosedTrade(env.DB, body);
+        return result.accepted
+          ? json({ ...result, execution_enabled: false })
+          : json({ error: "Unknown, ambiguous, or conflicting trade report" }, 409);
       }
 
       // =====================================================
@@ -234,11 +437,76 @@ export default {
           return json({ error: "Unsupported agent_status schema" }, 503);
         }
         const result = await env.DB.prepare(query).all();
+        let executor: Awaited<ReturnType<typeof executorStatus>>;
+        let executorStatusError = false;
+        try {
+          executor = await executorStatus(env);
+        } catch (error) {
+          executorStatusError = true;
+          console.error(
+            "EXECUTOR_STATUS_FAILURE",
+            error instanceof Error ? error.message : String(error)
+          );
+          executor = {
+            agent: "EXECUTOR",
+            mode: "LOCKED",
+            trading_enabled: env.TRADING_ENABLED === "true",
+            paper_mode: env.PAPER_MODE === "true",
+            demo_account_connected: false,
+            account_paused: true,
+            kill_switch: true,
+            executor_key_configured: !!env.EXECUTOR_API_KEY,
+            active_intents: 0,
+            intents: {},
+            position_management: {
+              trailing_stop: false,
+              modification: false,
+              close: false
+            },
+            worker_gate_open: false,
+            bridge_gate_required: true,
+            execution_enabled: false
+          };
+        }
+
+        const registry = (result.results as Array<Record<string, unknown>>)
+          .filter(row =>
+            row.name !== "EXECUTOR" &&
+            row.name !== "LOGGER" &&
+            row.name !== "EQUITY"
+          );
+        registry.push({
+          name: "EQUITY",
+          status: "READY",
+          detail: "Monitor-only account, P/L, drawdown, and equity curve; no order path",
+          last_seen_at: now()
+        });
+        registry.push({
+          name: "LOGGER",
+          status: "READY",
+          detail: "Read-only audit across scanner, risk, trade, and system events",
+          last_seen_at: now()
+        });
+        registry.push({
+          name: "EXECUTOR",
+          status: executorStatusError
+            ? "UNAVAILABLE"
+            : executor.mode === "WORKER_GATE_OPEN" ? "READY" : "LOCKED",
+          detail: executorStatusError
+            ? "Status unavailable; execution is fail-closed"
+            : [
+              `Worker gate: ${executor.worker_gate_open ? "OPEN" : "LOCKED"}`,
+              `demo heartbeat: ${executor.demo_account_connected ? "fresh" : "stale/offline"}`,
+              `account: ${executor.kill_switch ? "kill switch" : executor.account_paused ? "paused" : "active"}`
+            ].join("; "),
+          last_seen_at: now()
+        });
 
         return json({
-          agents: result.results,
-          count: result.results.length,
-          execution_enabled: false
+          agents: registry,
+          count: registry.length,
+          worker_gate_open: executor.worker_gate_open,
+          execution_enabled: executor.execution_enabled
         });
       }
 
@@ -495,8 +763,7 @@ export default {
           if (
             !item ||
             typeof item !== "object" ||
-            typeof item.symbol !== "string" ||
-            !/^[A-Za-z0-9._-]{1,32}$/.test(item.symbol) ||
+            !validSymbol(item.symbol) ||
             seenSymbols.has(item.symbol.toUpperCase()) ||
             typeof item.available !== "boolean"
           ) {
@@ -546,12 +813,16 @@ export default {
               candle.close < candle.low ||
               candle.close > candle.high
             ) {
-              return json({ error: "Invalid M1 candle" }, 422);
+              return json({
+                error: "Invalid M1 candle",
+                symbol: item.symbol
+              }, 422);
             }
           }
           const specValues = [
             item.spec.tick_size,
             item.spec.tick_value_loss,
+            item.spec.contract_size,
             item.spec.volume_min,
             item.spec.volume_max,
             item.spec.volume_step
@@ -560,11 +831,112 @@ export default {
             !specValues.every(value => Number.isFinite(value) && value > 0) ||
             item.spec.volume_max < item.spec.volume_min
           ) {
-            return json({ error: "Invalid MT5 symbol contract spec" }, 422);
+            return json({
+              error: "Invalid MT5 symbol contract spec",
+              symbol: item.symbol
+            }, 422);
           }
         }
 
         const result = await saveSizingInputs(env, body);
+        return json({
+          accepted: true,
+          ...result,
+          execution_enabled: false
+        });
+      }
+
+      // =====================================================
+      // MT5 COMPLETED M5/M15/H1/H4 CANDLES
+      // =====================================================
+      if (
+        url.pathname === "/api/v1/bridge/scanner-candles" &&
+        request.method === "POST"
+      ) {
+        const contentLength = Number(
+          request.headers.get("content-length") || 0
+        );
+        if (contentLength > 2 * 1024 * 1024) {
+          return json({ error: "Payload too large" }, 413);
+        }
+        let body: ScannerCandlesPayload;
+        try {
+          body = await request.json<ScannerCandlesPayload>();
+        } catch {
+          return json({ error: "Invalid JSON" }, 400);
+        }
+        if (
+          !body ||
+          typeof body !== "object" ||
+          typeof body.captured_at !== "string" ||
+          !Number.isFinite(Date.parse(body.captured_at)) ||
+          !Array.isArray(body.symbols) ||
+          body.symbols.length < 1 ||
+          body.symbols.length > 5
+        ) {
+          return json({ error: "Invalid scanner-candle snapshot" }, 422);
+        }
+
+        const seenSymbols = new Set<string>();
+        for (const item of body.symbols as ScannerCandleSymbol[]) {
+          if (
+            !item ||
+            typeof item !== "object" ||
+            !validSymbol(item.symbol) ||
+            seenSymbols.has(item.symbol.toUpperCase()) ||
+            !Array.isArray(item.timeframes) ||
+            item.timeframes.length !== 4
+          ) {
+            return json({ error: "Invalid scanner-candle symbol entry" }, 422);
+          }
+          seenSymbols.add(item.symbol.toUpperCase());
+          const seenFrames = new Set<string>();
+          for (const frame of item.timeframes) {
+            if (
+              !frame ||
+              !["M5", "M15", "H1", "H4"].includes(frame.timeframe) ||
+              seenFrames.has(frame.timeframe) ||
+              typeof frame.available !== "boolean" ||
+              !Array.isArray(frame.candles) ||
+              frame.candles.length > 250 ||
+              (frame.error != null &&
+                (typeof frame.error !== "string" || frame.error.length > 200))
+            ) {
+              return json({ error: "Invalid scanner timeframe candles" }, 422);
+            }
+            seenFrames.add(frame.timeframe);
+            if (!frame.available && frame.candles.length) {
+              return json({
+                error: "Unavailable timeframe must not include candles"
+              }, 422);
+            }
+            for (let index = 0; index < frame.candles.length; index++) {
+              const candle = frame.candles[index];
+              if (
+                !candle ||
+                typeof candle.time !== "string" ||
+                !Number.isFinite(Date.parse(candle.time)) ||
+                ![candle.open, candle.high, candle.low, candle.close].every(
+                  value => Number.isFinite(value) && value > 0
+                ) ||
+                candle.high < candle.low ||
+                candle.high < candle.open ||
+                candle.high < candle.close ||
+                candle.low > candle.open ||
+                candle.low > candle.close ||
+                (index > 0 &&
+                  Date.parse(candle.time) <=
+                    Date.parse(frame.candles[index - 1].time))
+              ) {
+                return json({ error: "Invalid or unordered OHLC candle" }, 422);
+              }
+            }
+          }
+          if (seenFrames.size !== 4) {
+            return json({ error: "All four scanner timeframes are required" }, 422);
+          }
+        }
+        const result = await saveScannerCandles(env, body);
         return json({
           accepted: true,
           ...result,
@@ -695,7 +1067,7 @@ export default {
       ) {
         // This route is unauthenticated (the dashboard polls it), so it
         // returns liveness only. Account login, server, balance and equity
-        // stay in D1 and are intentionally not exposed here.
+        // stay in PostgreSQL and are intentionally not exposed here.
         const row = await env.DB.prepare(`
           SELECT terminal_name, connected, trade_mode, received_at
           FROM bridge_heartbeats
@@ -748,14 +1120,9 @@ export default {
           rows.results.map(row => [row.symbol, row])
         );
         const observations = await env.DB.prepare(`
-          SELECT o.symbol, o.bid, o.ask, o.tick_time, o.received_at
-          FROM market_observations o
-          WHERE o.id = (
-            SELECT MAX(newest.id)
-            FROM market_observations newest
-            WHERE newest.symbol = o.symbol
-          )
-          ORDER BY o.symbol
+          SELECT symbol, bid, ask, tick_time, received_at
+          FROM market_observation_latest
+          ORDER BY symbol
         `).all<{
           symbol: string;
           bid: number;
@@ -795,7 +1162,10 @@ export default {
           app_env: env.APP_ENV,
           paper_mode: env.PAPER_MODE === "true",
           trading_enabled: env.TRADING_ENABLED === "true",
-          execution_enabled: false,
+          execution_enabled:
+            env.TRADING_ENABLED === "true" &&
+            env.PAPER_MODE === "true",
+          execution_scope: "DEMO_ONLY",
 
           risk: {
             max_risk_per_trade_pct:
@@ -894,6 +1264,7 @@ export default {
     batch: MessageBatch<any>,
     env: Env
   ): Promise<void> {
+    env = withPostgres(env);
 
     // -------------------------------------------------------
     // MARKET INGEST QUEUE
@@ -1026,6 +1397,22 @@ export default {
                 event: "position_sizer_run",
                 ...sizing
               }));
+              if (env.TRADING_ENABLED === "true") {
+                try {
+                  const executor = await enqueueEligibleTrades(env, scan.symbols);
+                  console.log(JSON.stringify({
+                    event: "executor_run",
+                    ...executor
+                  }));
+                } catch (executorErr) {
+                  console.error(
+                    "EXECUTOR_QUEUE_FAILURE",
+                    executorErr instanceof Error
+                      ? executorErr.message
+                      : String(executorErr)
+                  );
+                }
+              }
             } catch (sizerErr) {
               console.error(
                 "POSITION_SIZER_FAILURE",
@@ -1056,7 +1443,7 @@ export default {
         }
 
       } catch (err) {
-        // IMPROVED D1 ERROR LOGGING
+        // Database errors must fail this batch so queue delivery can retry.
         const errorDetails = err instanceof Error
           ? {
               name: err.name,
@@ -1069,7 +1456,7 @@ export default {
             };
 
         console.error(
-          "MARKET_QUEUE_D1_FAILURE",
+          "MARKET_QUEUE_DATABASE_FAILURE",
           JSON.stringify({
             ...errorDetails,
             batchSize: batch.messages.length,
@@ -1134,6 +1521,7 @@ export default {
     env: Env,
     ctx: ExecutionContext
   ): Promise<void> {
+    env = withPostgres(env);
 
     ctx.waitUntil((async () => {
 

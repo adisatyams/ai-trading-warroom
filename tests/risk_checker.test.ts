@@ -7,6 +7,7 @@ import {
   type RiskContext
 } from "../src/risk_checker.ts";
 import { STRATEGY, STRATEGY_VERSION, type Observation } from "../src/scanner.ts";
+import { riskConfig } from "../src/risk_store.ts";
 
 const NOW = Date.parse("2026-11-20T12:00:00.000Z");
 const ISO_NOW = new Date(NOW).toISOString();
@@ -28,8 +29,9 @@ function candidate(
   overrides: Partial<RiskCandidate> = {}
 ): RiskCandidate {
   return {
-    signal_id: `${STRATEGY}:EURUSD:${ISO_NOW}`,
+    signal_id: `${STRATEGY}:EURUSD:M15:${ISO_NOW}`,
     symbol: "EURUSD",
+    timeframe: "M15",
     strategy: STRATEGY,
     strategy_version: STRATEGY_VERSION,
     state: "BUY",
@@ -74,9 +76,20 @@ function context(overrides: Partial<RiskContext> = {}): RiskContext {
 test("eligible output is limited to paper review and requires all fresh inputs", () => {
   const result = evaluateRisk(candidate(), context());
   assert.equal(result.decision, "ELIGIBLE_FOR_PAPER_REVIEW");
+  assert.equal(result.timeframe, "M15");
   assert.deepEqual(result.reasons, []);
   assert.equal(result.execution_enabled, false);
   assert.ok(Object.values(result.checks).every(Boolean));
+});
+
+test("demo execution eligibility requires the same complete risk checks", () => {
+  const result = evaluateRisk(
+    candidate(),
+    context({ tradingEnabled: true })
+  );
+  assert.equal(result.decision, "ELIGIBLE_FOR_DEMO_EXECUTION");
+  assert.equal(result.execution_enabled, false);
+  assert.deepEqual(result.reasons, []);
 });
 
 test("rejects a spread above the symbol limit", () => {
@@ -86,6 +99,18 @@ test("rejects a spread above the symbol limit", () => {
   );
   assert.equal(result.decision, "REJECTED");
   assert.equal(result.checks.spread, false);
+});
+
+test("rejects a scanner result older than its timeframe freshness window", () => {
+  const result = evaluateRisk(
+    candidate({
+      timeframe: "M5",
+      as_of: new Date(NOW - 601_000).toISOString()
+    }),
+    context()
+  );
+  assert.equal(result.checks.signal_freshness, false);
+  assert.equal(result.decision, "REJECTED");
 });
 
 test("uses a prefix spread limit for broker-suffixed symbols", () => {
@@ -215,4 +240,15 @@ test("rejects stale inputs, unapproved strategy, and unsafe execution mode", () 
 test("uses the configured daily loss and drawdown thresholds", () => {
   assert.equal(DEFAULT_RISK_CONFIG.maxDailyLossPct, 2);
   assert.equal(DEFAULT_RISK_CONFIG.maxDailyDrawdownPct, 3);
+});
+
+test("invalid configured daily loss or drawdown fails closed", () => {
+  assert.throws(
+    () => riskConfig({ MAX_DAILY_LOSS_PCT: "-1" } as any),
+    /MAX_DAILY_LOSS_PCT/
+  );
+  assert.throws(
+    () => riskConfig({ MAX_DRAWDOWN_PCT: "not-a-number" } as any),
+    /MAX_DRAWDOWN_PCT/
+  );
 });

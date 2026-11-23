@@ -15,13 +15,15 @@ button{background:#253a55;color:white;border:0;border-radius:8px;padding:9px 13p
 pre{white-space:pre-wrap;overflow-wrap:anywhere;color:#b9c8da}
 </style></head>
 <body><main class="wrap">
-<header><div><h1>AI Trading WarRoom</h1><p class="muted">Cloudflare Control Plane · Phase 1 telemetry only</p></div><span class="pill">EXECUTION LOCKED</span></header>
+<header><div><h1>AI Trading WarRoom</h1><p class="muted">Cloudflare Control Plane · Demo execution</p></div><span class="pill" id="executionpill">EXECUTION LOCKED</span></header>
 <div class="grid">
 <section class="card"><div class="muted">API</div><h2 id="api">Checking…</h2></section>
 <section class="card"><div class="muted">MT5 Bridge</div><h2 id="bridge">Waiting…</h2><small id="bridgeage" class="muted"></small></section>
-<section class="card"><div class="muted">Trading mode</div><h2>Demo / No orders</h2><small class="muted">Executor locked in Phase 1</small></section>
+<section class="card"><div class="muted">Trading mode</div><h2 id="tradingmode">Demo / Locked</h2><small class="muted" id="tradingdetail">Checking Executor gates…</small></section>
 </div>
 <section class="card"><h2>Agent Registry</h2><table><thead><tr><th>Agent</th><th>Status</th><th>Description</th></tr></thead><tbody id="agents"></tbody></table></section>
+<section class="card"><h2>Logger</h2><p class="muted">Audit log for signals, risk decisions, trade outcomes, and system events.</p><button onclick="loadLogs()">Load recent logs</button><span id="logstatus" class="muted"></span><table><thead><tr><th>Time</th><th>Source</th><th>Level</th><th>Event</th><th>Details</th></tr></thead><tbody id="logs"></tbody></table></section>
+<section class="card"><h2>Equity Monitor</h2><p class="muted">Read-only account performance; it does not make trading decisions.</p><button onclick="loadEquity()">Load equity metrics</button><span id="equityStatus" class="muted"></span><table><thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody id="equityMetrics"></tbody></table><h3>Equity curve (latest 100 snapshots)</h3><table><thead><tr><th>Captured at</th><th>Balance</th><th>Equity</th><th>Floating P/L</th></tr></thead><tbody id="equityCurve"></tbody></table></section>
 <div class="grid">
 <section class="card"><h2>Latest Market Snapshot</h2><table><thead><tr><th>Symbol</th><th>Bid</th><th>Ask</th><th>Last update</th></tr></thead><tbody id="markets"></tbody></table></section>
 <section class="card"><h2>Control state</h2><p class="muted">Controls affect monitoring state only. They do not enable trading.</p>
@@ -29,11 +31,88 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;color:#b9c8da}
 </div>
 <script>
 async function api(path,opts={}){const r=await fetch(path,opts);if(!r.ok)throw Error(path+' '+r.status);return r.json()}
+async function loadLogs(){
+ const key=prompt('Enter WarRoom API key to view audit logs:');if(!key)return;
+ const status=document.querySelector('#logstatus');
+ status.textContent=' Loading…';
+ try{
+  const result=await api('/api/v1/logger/events?limit=50',{headers:{'x-api-key':key}});
+  const body=document.querySelector('#logs');
+  body.replaceChildren();
+  for(const item of result.items){
+   const row=document.createElement('tr');
+   for(const value of [item.occurred_at,item.source,item.level,item.event_type,item.message+' — '+item.details]){
+    const cell=document.createElement('td');
+    cell.textContent=value||'';
+    row.appendChild(cell);
+   }
+   body.appendChild(row);
+  }
+  status.textContent=` ${result.count} events`;
+ }catch(error){
+  status.textContent=' Unable to load logs; check API key and Worker status.';
+  console.error(error);
+ }
+}
+async function loadEquity(){
+ const key=prompt('Enter WarRoom API key to view account performance:');if(!key)return;
+ const status=document.querySelector('#equityStatus');
+ status.textContent=' Loading…';
+ try{
+  const result=await api('/api/v1/equity/status',{headers:{'x-api-key':key}});
+  const metrics=[
+   ['Balance',result.balance,result.currency],
+   ['Equity',result.equity,result.currency],
+   ['Floating P/L',result.floating_pl,result.currency],
+   ['Realized P/L',result.realized_pl,result.currency],
+   ['Daily P/L (equity change)',result.daily_pl,result.currency],
+   ['Daily realized P/L',result.daily_realized_pl,result.currency],
+   ['Maximum drawdown',result.max_drawdown_pct,'%'],
+   ['Win rate',result.win_rate_pct,'%'],
+   ['Profit factor',result.profit_factor,''],
+   ['Closed trades with P/L',result.closed_trades_with_pnl,''],
+   ['Snapshot age',result.age_seconds,'seconds']
+  ];
+  const metricBody=document.querySelector('#equityMetrics');
+  metricBody.replaceChildren();
+  for(const [name,value,unit] of metrics){
+   const row=document.createElement('tr');
+   const label=document.createElement('td');label.textContent=name;row.appendChild(label);
+   const amount=document.createElement('td');
+   amount.textContent=value===null?'No data':`${Number(value).toFixed(2)} ${unit||''}`;
+   row.appendChild(amount);metricBody.appendChild(row);
+  }
+  const curveBody=document.querySelector('#equityCurve');
+  curveBody.replaceChildren();
+  for(const point of result.equity_curve){
+   const row=document.createElement('tr');
+   for(const value of [point.captured_at,point.balance,point.equity,point.floating_pnl]){
+    const cell=document.createElement('td');
+    cell.textContent=value===null?'—':String(value);
+    row.appendChild(cell);
+   }
+   curveBody.appendChild(row);
+  }
+  status.textContent=result.data_available
+   ?` Monitoring only · ${result.closed_trades_with_pnl} closed trades with P/L`
+   :' No account snapshots yet';
+ }catch(error){
+  status.textContent=' Unable to load metrics; check API key and Worker status.';
+  console.error(error);
+ }
+}
 async function refresh(){
  try{
   await api('/health');document.querySelector('#api').textContent='ONLINE';
-  const a=await api('/api/v1/agents');document.querySelector('#agents').innerHTML=a.agents.map(x=>`<tr><td>${x.name}</td><td>${x.status}</td><td>${x.detail||''}</td></tr>`).join('');
-  const b=await api('/api/v1/bridge/status');document.querySelector('#bridge').textContent=b.fresh?'CONNECTED':'OFFLINE / STALE';document.querySelector('#bridgeage').textContent=b.age_seconds===undefined?'No heartbeat':`Last heartbeat ${b.age_seconds}s ago`;
+  const a=await api('/api/v1/agents');
+  document.querySelector('#agents').innerHTML=a.agents.map(x=>`<tr><td>${x.name}</td><td>${x.status}</td><td>${x.detail||''}</td></tr>`).join('');
+  const workerGateOpen=a.worker_gate_open===true;
+  const executionEnabled=a.execution_enabled===true&&workerGateOpen;
+  document.querySelector('#executionpill').textContent=executionEnabled?'DEMO EXECUTION ENABLED':'EXECUTION LOCKED';
+  document.querySelector('#tradingmode').textContent=executionEnabled?'Demo / Execution enabled':'Demo / Locked';
+  const executor=a.agents.find(x=>x.name==='EXECUTOR');
+  document.querySelector('#tradingdetail').textContent=executor?.detail||'Executor status unavailable';
+  const b=await api('/api/v1/bridge/status');document.querySelector('#bridge').textContent=b.connected&&b.fresh?'CONNECTED':'OFFLINE / STALE';document.querySelector('#bridgeage').textContent=b.age_seconds===undefined?'No heartbeat':`Last heartbeat ${b.age_seconds}s ago`;
   const m=await api('/api/v1/market/latest');document.querySelector('#markets').innerHTML=m.items.map(x=>`<tr><td>${x.symbol}</td><td>${x.bid??'-'}</td><td>${x.ask??'-'}</td><td>${x.received_at}</td></tr>`).join('');
  }catch(e){document.querySelector('#api').textContent='ERROR';console.error(e)}
 }
@@ -42,5 +121,5 @@ async function control(action){
  const r=await fetch('/api/v1/control/'+action,{method:'POST',headers:{'x-api-key':key}});
  document.querySelector('#control').textContent=JSON.stringify(await r.json(),null,2);
 }
-refresh();setInterval(refresh,5000);
+refresh();setInterval(refresh,30000);
 </script></main></body></html>

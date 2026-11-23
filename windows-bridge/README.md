@@ -1,8 +1,9 @@
-# MT5 Risk Checker and Position Sizer data feeds
+# MT5 Scanner, Risk Checker, Position Sizer, Executor, and Logger
 
-The Risk Checker only screens scanner results for **paper/research review**. It
-does not create trade intents or send orders. Missing or stale news, position,
-market, or equity data rejects a candidate.
+The Scanner, Risk Checker, and Position Sizer produce per-timeframe candidates,
+fail-closed risk decisions, and broker-specific sizes. The Executor can send a
+market order only to an MT5 demo account; it remains locked unless both the
+Worker and this bridge are explicitly enabled.
 
 ## Enable the MT5 economic calendar feed
 
@@ -17,17 +18,21 @@ market, or equity data rejects a candidate.
    or restart `bridge.py`. The bridge sends the calendar and open-position
    snapshots every `RISK_SNAPSHOT_SECONDS` (default 60).
 
-The bridge example defaults to the Exness suffix-`m` symbols
-`XAUUSDm,EURUSDm,GBPUSDm,USDJPYm,AUDUSDm,USDCADm,BTCUSDm,ETHUSDm`. Keep
-`SYMBOLS` aligned with the exact names shown in MT5 Market Watch.
+The bridge discovers every instrument currently visible in MT5 Market Watch,
+including broker suffixes such as `m`, and refreshes that list once per risk
+snapshot. Make the intended instruments visible in Market Watch before starting
+the bridge. It sends completed M5, M15, H1, and H4 candles for scanner analysis;
+220 bars are requested for each timeframe and the bridge chunks requests to
+stay within the API limits.
 
-   The bridge also submits 29 completed M1 candles and the broker's tick-value and
-   volume constraints for each configured symbol. Position Sizer uses Wilder
-   ATR(14) on M1, places a hypothetical stop 2x ATR from the current quote, and
-   floors volume to the broker's volume step so estimated risk does not exceed
-   0.25% of current equity. Missing, stale, invalid, or below-minimum inputs reject
-   the size; no order is submitted. The estimate does not include commissions or
-   slippage.
+The bridge also submits 29 completed M1 candles and the broker's tick-value and
+volume and contract-size specifications for each visible symbol. Scanner uses EMA(20/50/200),
+MACD(12/26/9), RSI(14), ATR(14), and Bollinger Bands(20, 2). The rule score uses
+weights 25/25/15/20/15 and the candidate threshold is 70; it is a heuristic, not
+a probability of profit. Hypothetical SL is 2x M1 ATR(14), TP is 2R, and the
+Sizer floors volume to the broker's volume step so estimated risk does not exceed
+0.25% of current equity. Missing, stale, invalid, or below-minimum inputs reject
+the size. The estimate does not include commissions or slippage.
 
 The EA converts broker-server event times to UTC using the server/GMT offset.
 If the EA cannot read the MT5 calendar or the exported file is older than 150
@@ -37,15 +42,19 @@ valid snapshot.
 
 ## Authenticated API
 
+- `GET /api/v1/scanner/latest` reports the latest result for each symbol and
+  timeframe; optional filters include `symbol` and `timeframe=M5|M15|H1|H4`.
 - `GET /api/v1/risk/status` reports the policy, input freshness, and latest
-  per-symbol screening decisions.
+  per-symbol/timeframe screening decisions.
 - `GET /api/v1/risk/latest` returns latest decisions; optional filters:
-  `symbol` and `decision=ELIGIBLE_FOR_PAPER_REVIEW|REJECTED`.
+  `symbol`, `timeframe`, and `decision=ELIGIBLE_FOR_PAPER_REVIEW|REJECTED`.
 - `GET /api/v1/sizer/status` reports M1 input freshness and latest sizing results.
-- `GET /api/v1/sizer/latest` returns the latest per-symbol paper-review size.
+- `GET /api/v1/sizer/latest` returns the latest per-symbol/timeframe paper-review
+  or demo-execution size.
 - The bridge posts calendar data to `/api/v1/bridge/news-calendar` and positions
-  to `/api/v1/bridge/positions`, plus ATR and contract data to
-  `/api/v1/bridge/sizing-inputs`, using the existing `x-api-key`.
+  to `/api/v1/bridge/positions`, ATR and contract data to
+  `/api/v1/bridge/sizing-inputs`, and scanner candles to
+  `/api/v1/bridge/scanner-candles`, using the existing `x-api-key`.
 
 The agreed gates are a 2% UTC-day loss limit, 3% UTC-day drawdown, at most three
 open positions, no existing position in the candidate symbol, a 15-minute
@@ -58,5 +67,64 @@ The UTC-day baseline must be observed within two minutes after midnight UTC.
 If the bridge was not reporting equity then, daily loss and drawdown checks
 remain blocked for that UTC day rather than assuming a safe baseline.
 
-Position Sizer runs only after a fresh Risk Checker pass. Its stop and size are
-research estimates, not trading instructions or authorization.
+Position Sizer runs only after a fresh Risk Checker pass. The Executor selects
+the highest-scoring eligible timeframe per symbol and enforces one active intent
+per symbol. It uses a market order at the current broker quote with the Sizer's
+SL/TP and volume, rechecks the demo account, open positions, broker volume
+limits, expiry, and current-price risk budget, then records the broker result.
+Uncertain broker outcomes remain locked for manual reconciliation; commands are
+never automatically retried after dispatch.
+
+## Executor activation and API
+
+The repository defaults remain locked: `TRADING_ENABLED=false` in Wrangler and
+`MT5_TRADING_ENABLED=false` in `.env.windows.example`. Position management is
+not enabled: trailing stops, modification, and closing are deferred.
+
+Before any activation:
+
+1. Apply `postgres/003_executor.sql` to Aiven PostgreSQL.
+2. Set the Worker secret `EXECUTOR_API_KEY` and the same value in the bridge's
+   local `.env.windows`; it is separate from `WARROOM_API_KEY`.
+3. Keep `PAPER_MODE=true` and verify the VPS is connected to the intended demo
+   account.
+4. The account coordinator starts paused. Use the authenticated
+   `/api/v1/control/resume` route to clear the pause. A latched kill switch
+   continues to block execution.
+5. To explicitly arm demo orders later, set both Worker `TRADING_ENABLED=true`
+   and bridge `MT5_TRADING_ENABLED=true`. Either gate being false prevents
+   order dispatch.
+
+- `GET /api/v1/executor/status` reports the Worker gate, demo heartbeat, and
+  outstanding intent counts (authenticated by `WARROOM_API_KEY`).
+- A dedicated heartbeat thread sends a status update every 30 seconds. It only
+  reports the terminal connected while the MT5 polling loop is making progress;
+  if that loop stalls for 90 seconds, the heartbeat is marked disconnected and
+  Executor stays fail-closed.
+- The bridge claims commands from `GET /api/v1/bridge/trade-commands` and
+  acknowledges them at `POST /api/v1/bridge/trade-commands/ack`, authenticated
+  only by `EXECUTOR_API_KEY`.
+- Closed trades with the WarRoom order magic and `WR:` intent comment are
+  reconciled from MT5 deal history and reported to
+  `POST /api/v1/bridge/trade-history/close`. This fills the recorded exit price
+  and realized P/L; reports that cannot be matched to exactly one trade intent
+  are rejected.
+- Demo-eligible results appear as
+  `ELIGIBLE_FOR_DEMO_EXECUTION` and `SIZED_FOR_DEMO_EXECUTION`; otherwise the
+  existing paper-review decisions remain advisory.
+
+## Logger
+
+The Logger exposes a read-only timeline that combines scanner signals, Risk
+Checker decisions and rejection reasons, trade outcomes, and Worker/system
+events. Use **Load recent logs** on the dashboard or call
+`GET /api/v1/logger/events?limit=50` with the `WARROOM_API_KEY`. The limit must
+be between 1 and 100. Trade exit price and realized P/L are populated after the
+bridge reconciles a closed MT5 deal.
+
+## Equity
+
+The read-only `GET /api/v1/equity/status` endpoint reports the latest balance,
+equity, floating and realized P/L, UTC daily P/L, maximum drawdown, win rate,
+profit factor, and the latest 100 equity snapshots. It is authenticated with
+`WARROOM_API_KEY` and does not make trading decisions.

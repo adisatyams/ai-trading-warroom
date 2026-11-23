@@ -4,8 +4,11 @@ import {
   evaluate,
   rejectInvalidTick,
   signalId,
+  evaluateTimeframe,
   DEFAULT_CONFIG,
+  LEGACY_STRATEGY,
   STRATEGY,
+  type Candle,
   type Observation
 } from "../src/scanner.ts";
 
@@ -61,7 +64,7 @@ test("BUY on aligned uptrend", () => {
   assert.ok(r.features.trend_bps! > 0);
   assert.ok(r.features.momentum_bps! > 0);
   assert.ok(r.reasons.length >= 3);
-  assert.equal(r.strategy, STRATEGY);
+  assert.equal(r.strategy, LEGACY_STRATEGY);
 });
 
 test("SELL on aligned downtrend", () => {
@@ -119,7 +122,10 @@ test("rejectInvalidTick produces a REJECTED/INVALID_PRICE result", () => {
   const r = rejectInvalidTick("EURUSD", "2026-11-20T02:00:00.000Z", "ask < bid");
   assert.equal(r.state, "REJECTED");
   assert.equal(r.reject_reason, "INVALID_PRICE");
-  assert.equal(r.signal_id, signalId("EURUSD", "2026-11-20T02:00:00.000Z"));
+  assert.equal(
+    r.signal_id,
+    signalId("EURUSD", "2026-11-20T02:00:00.000Z", "M1", LEGACY_STRATEGY)
+  );
 });
 
 test("REJECTED STALE_DATA when newest observation is too old", () => {
@@ -194,10 +200,138 @@ test("deterministic: same input gives identical output and signal_id", () => {
   const a = evaluate("EURUSD", obs, nowAfter(obs));
   const b = evaluate("EURUSD", obs, nowAfter(obs));
   assert.deepEqual(a, b);
-  assert.equal(a.signal_id, signalId("EURUSD", obs[24].received_at));
+  assert.equal(
+    a.signal_id,
+    signalId("EURUSD", obs[24].received_at, "M1", LEGACY_STRATEGY)
+  );
 });
 
 test("default config matches the agreed design (SMA 5/20)", () => {
   assert.equal(DEFAULT_CONFIG.shortWindow, 5);
   assert.equal(DEFAULT_CONFIG.longWindow, 20);
+});
+
+function indicatorCandles(
+  direction: 1 | -1,
+  breakout = true,
+  timeframeSeconds = 300
+): Candle[] {
+  const count = 220;
+  return Array.from({ length: count }, (_, index) => {
+    const trend = 100 + direction * index * 0.01;
+    const close =
+      breakout && index === count - 1
+        ? trend + direction * 1
+        : trend;
+    const time = new Date(
+      T0 + index * timeframeSeconds * 1000
+    ).toISOString();
+    return {
+      time,
+      open: close - direction * 0.005,
+      high: close + 0.02,
+      low: close - 0.02,
+      close
+    };
+  });
+}
+
+test("multi-timeframe scanner scores an aligned breakout and emits M1 ATR 2R levels", () => {
+  const candles = indicatorCandles(1);
+  const nowMs = Date.parse(candles[candles.length - 1].time) + 60_000;
+  const result = evaluateTimeframe(
+    "EURUSDm",
+    "M5",
+    candles,
+    {
+      bid: candles[candles.length - 1].close,
+      ask: candles[candles.length - 1].close + 0.0001,
+      received_at: new Date(nowMs - 5_000).toISOString()
+    },
+    nowMs,
+    0.1
+  );
+  assert.equal(result.state, "BUY");
+  assert.equal(result.timeframe, "M5");
+  assert.equal(result.score, 70);
+  assert.equal(result.features.buy_score, 70);
+  assert.equal(result.features.sell_score, 0);
+  assert.ok(result.features.ema20! > result.features.ema50!);
+  assert.ok(result.features.ema50! > result.features.ema200!);
+  assert.ok(Math.abs(result.stop_loss! - (result.entry! - 0.2)) < 1e-8);
+  assert.ok(Math.abs(result.take_profit! - (result.entry! + 0.4)) < 1e-8);
+  assert.match(result.signal_id, /:M5:/);
+});
+
+test("multi-timeframe scanner keeps sub-threshold momentum as WATCH", () => {
+  const candles = indicatorCandles(1, false);
+  const nowMs = Date.parse(candles[candles.length - 1].time) + 60_000;
+  const result = evaluateTimeframe(
+    "EURUSD",
+    "M15",
+    candles,
+    {
+      bid: candles[candles.length - 1].close,
+      ask: candles[candles.length - 1].close + 0.0001,
+      received_at: new Date(nowMs - 5_000).toISOString()
+    },
+    nowMs,
+    0.1
+  );
+  assert.equal(result.state, "WATCH");
+  assert.ok(result.score !== null && result.score < DEFAULT_CONFIG.minSignalScore);
+  assert.equal(result.entry, null);
+});
+
+test("scanner produces separate SELL candidates for H1 and H4", () => {
+  const outputs = (["H1", "H4"] as const).map(timeframe => {
+    const seconds = timeframe === "H1" ? 3_600 : 14_400;
+    const candles = indicatorCandles(-1, true, seconds);
+    const nowMs = Date.parse(candles[candles.length - 1].time) + 60_000;
+    const quote = {
+      bid: candles[candles.length - 1].close - 0.0001,
+      ask: candles[candles.length - 1].close,
+      received_at: new Date(nowMs - 5_000).toISOString()
+    };
+    return evaluateTimeframe(
+      "EURUSDm",
+      timeframe,
+      candles,
+      quote,
+      nowMs,
+      0.1
+    );
+  });
+  assert.deepEqual(outputs.map(result => result.state), ["SELL", "SELL"]);
+  assert.notEqual(outputs[0].signal_id, outputs[1].signal_id);
+  assert.ok(outputs.every(result => result.score! >= DEFAULT_CONFIG.minSignalScore));
+});
+
+test("multi-timeframe scanner fails closed on stale candle and malformed chronology", () => {
+  const stale = indicatorCandles(1);
+  const staleNow = Date.parse(stale[stale.length - 1].time) + 900_000;
+  const quote = {
+    bid: 102,
+    ask: 102.0001,
+    received_at: new Date(staleNow - 1_000).toISOString()
+  };
+  assert.equal(
+    evaluateTimeframe("EURUSD", "M5", stale, quote, staleNow, 0.1).reject_reason,
+    "STALE_CANDLES"
+  );
+
+  const unordered = indicatorCandles(-1);
+  unordered[100] = { ...unordered[100], time: unordered[99].time };
+  const nowMs = Date.parse(unordered[unordered.length - 1].time) + 60_000;
+  assert.equal(
+    evaluateTimeframe(
+      "EURUSD",
+      "H1",
+      unordered,
+      { ...quote, received_at: new Date(nowMs - 1_000).toISOString() },
+      nowMs,
+      0.1
+    ).reject_reason,
+    "INVALID_CANDLES"
+  );
 });

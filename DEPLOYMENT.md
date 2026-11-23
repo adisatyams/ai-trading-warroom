@@ -2,16 +2,21 @@
 
 ## Design
 - Worker serves static dashboard assets and `/api/*`.
-- D1 stores operational records and latest snapshots.
+- Aiven PostgreSQL stores operational records through a Cloudflare Hyperdrive
+  binding named `HYPERDRIVE`.
 - Queues decouple market ingestion and agent task processing.
 - R2 archives raw market events in JSONL batches.
 - Durable Object holds per-account pause/kill-switch state.
 - Cron checks Windows bridge heartbeat.
-- Windows VPS runs MT5 and a telemetry-only Python bridge.
-- Trade execution is deliberately locked; `/api/v1/trading/execute` is not implemented as an order sender.
+- Windows VPS runs MT5 and the Python bridge, which can submit demo-only market
+  orders when separately armed.
+- Execution is locked by default. The disabled `/api/v1/trading/execute` route
+  is not an order sender; the demo Executor uses a separate authenticated pull
+  and acknowledgement API.
 
 ## Prerequisites
-- Cloudflare account with Workers, D1, Queues and R2 enabled.
+- Cloudflare account with Workers, Hyperdrive, Queues and R2 enabled.
+- An Aiven PostgreSQL database.
 - Node.js 20+ and npm on your development PC.
 - Wrangler 4.x.
 - Exness MT5 Demo terminal on Windows VPS.
@@ -24,7 +29,6 @@ npx wrangler login
 
 ## 2. Create Cloudflare resources
 ```bash
-npx wrangler d1 create warroom-db
 npx wrangler queues create warroom-market-ingest
 npx wrangler queues create warroom-agent-tasks
 npx wrangler queues create warroom-trade-commands
@@ -32,41 +36,50 @@ npx wrangler queues create warroom-market-dlq
 npx wrangler queues create warroom-agent-dlq
 npx wrangler r2 bucket create warroom-market-archive
 ```
-Copy the D1 database_id into wrangler.jsonc. Queue producer/consumer names and R2 bucket name must match exactly.
+Queue producer/consumer names and R2 bucket name must match exactly. Rotate the
+Aiven password before configuring Hyperdrive: the previously shared database
+URL is compromised. Create a Hyperdrive configuration with the new URL and add
+the returned ID to `wrangler.jsonc`:
 
-## 3. Apply D1 migrations
-Migrations: `0001_init.sql` (core tables) and `0002_scanner.sql` (scanner observations and results; additive only).
+```jsonc
+"compatibility_flags": ["nodejs_compat"],
+"hyperdrive": [
+  { "binding": "HYPERDRIVE", "id": "<hyperdrive-configuration-id>" }
+]
+```
+
+Remove the `d1_databases` section when the Hyperdrive binding is available.
+
+## 3. Initialize PostgreSQL
+This deployment starts with an empty Aiven database; D1 records are not copied.
+Apply `postgres/001_initial_schema.sql` using the Aiven console or `psql`.
+For an existing database already initialized with 001, apply
+`postgres/002_multi_timeframe_scanner.sql` and then
+`postgres/003_executor.sql`. Fresh databases should apply 001, 002, and 003 in
+order before deploying.
+Keep the connection URL in a secure environment variable or password manager;
+never commit or print it.
 
 Validate locally first, and do not continue if anything fails:
+
 ```bash
 npm ci
 npm run typecheck
 npm test
-npx wrangler d1 migrations apply warroom-db --local
 npx wrangler deploy --dry-run
-```
-
-Before touching an existing remote database, back it up and confirm its real schema matches the migrations (the code assumes exactly these columns):
-```bash
-npx wrangler d1 export warroom-db --remote --output backup-$(date +%F).sql
-npx wrangler d1 execute warroom-db --remote --command "PRAGMA table_info(agent_status)"
-npx wrangler d1 execute warroom-db --remote --command "PRAGMA table_info(equity_snapshots)"
-npx wrangler d1 migrations list warroom-db --remote
-```
-`agent_status` must have `agent_name`, `status`, `last_seen_at`, `detail`. `equity_snapshots` must have `balance`, `equity`, `floating_pnl`, `currency`, `captured_at` (no account column). If the remote differs, stop and reconcile before applying anything.
-
-Then apply:
-```bash
-npx wrangler d1 migrations apply warroom-db --remote
 ```
 
 ## 4. Configure secrets
 ```bash
 npx wrangler secret put WARROOM_API_KEY
+npx wrangler secret put EXECUTOR_API_KEY
 npx wrangler secret put TELEGRAM_BOT_TOKEN
 npx wrangler secret put TELEGRAM_CHAT_ID
 ```
-For API key, generate a long random value locally, then paste it into Wrangler and the Windows bridge `.env.windows`. Telegram secrets can be left unset until Telegram is configured. Never commit secrets.
+Generate separate long random values for `WARROOM_API_KEY` and
+`EXECUTOR_API_KEY`. Put the matching values into Wrangler and the Windows
+bridge `.env.windows`; never reuse or commit secrets. Telegram secrets can be
+left unset until Telegram is configured.
 
 ## 5. Deploy
 ```bash
@@ -85,7 +98,7 @@ Copy-Item .env.windows.example .env.windows
 notepad .env.windows
 python bridge.py
 ```
-Set `WARROOM_API_URL` to the deployed Worker URL, `WARROOM_API_KEY` to the secret set above, exact MT5 symbol names, and terminal path.
+Set `WARROOM_API_URL` to the deployed Worker URL, `WARROOM_API_KEY` to the secret set above, and the terminal path. The bridge automatically scans every instrument visible in MT5 Market Watch.
 
 ## 7. Verify
 - `GET /health`
@@ -95,16 +108,40 @@ Set `WARROOM_API_URL` to the deployed Worker URL, `WARROOM_API_KEY` to the secre
 - Dashboard shows agents, heartbeat, and market symbols.
 - `GET /api/v1/system/config` reports `execution_enabled:false`.
 - `POST /api/v1/trading/execute` is not an active order route; execution remains locked.
-- `GET /api/v1/scanner/status` and `GET /api/v1/scanner/latest` (both require the `x-api-key` header). Right after deploy every symbol is `WARMING_UP`; with 60s batches it takes about 20 minutes to reach 20 observations.
+- `GET /api/v1/executor/status` reports the Worker gate, demo heartbeat, and
+  account pause/kill state. By default, the account begins paused and both
+  trading flags are false.
+- `GET /api/v1/scanner/status` and `GET /api/v1/scanner/latest` (both require the `x-api-key` header). The scanner warms up after MT5 sends at least 200 completed candles per timeframe.
 - `GET /api/v1/bridge/status` returns liveness only (no account login, server, balance or equity).
 
-## Deterministic scanner (SNAPSHOT_MOMENTUM_V1)
-Research-only: it produces BUY / SELL / WATCH / WARMING_UP / REJECTED candidates from SMA 5/20, momentum and spread, and writes every evaluation to `scanner_results` for audit. It has no path to the executor; `TRADING_ENABLED=false` and `PAPER_MODE=true` must stay set. The score is a rule score, not a probability of profit. Spread limits and trend/momentum thresholds in `src/scanner.ts` are untuned starting values; review them against real spreads in `market_observations`. Observations are kept 48 hours and results 14 days (pruned by the cron trigger).
+## Deterministic scanner (MULTI_TIMEFRAME_INDICATORS_V1)
+
+It produces a separate result for each visible MT5 symbol and
+M5/M15/H1/H4 timeframe from completed candles, using EMA(20/50/200),
+MACD(12/26/9), RSI(14), ATR(14), and Bollinger Bands(20, 2). The rule score is
+weighted 25/25/15/20/15 with a 70-point candidate threshold; it is a heuristic,
+not a probability of profit. Hypothetical SL uses 2x M1 ATR(14) and TP is 2R.
+The bridge discovers all instruments visible in MT5 Market Watch and chunks its
+market, candle, and sizing payloads to the Worker limits. Scanner signals alone
+never send orders. The Executor requires a fresh demo heartbeat, passing Risk
+Checker and Sizer results, an unpaused account, and both Worker
+`TRADING_ENABLED` and local `MT5_TRADING_ENABLED` set to `true`. The repository
+defaults remain `TRADING_ENABLED=false`, `PAPER_MODE=true`, and
+`MT5_TRADING_ENABLED=false`; do not change them until explicitly ready to arm a
+demo terminal. Before arming, use the authenticated `/api/v1/control/resume`
+route; a latched kill switch continues to block execution. Tick observations are
+retained for 48 hours and scan results for 14 days (pruned by the cron trigger).
 
 ## Notes on the architecture
 - Queue delivery can retry. Consumers must be idempotent; never treat a queue delivery as proof that a broker order has executed.
-- Do not send every raw tick to D1 at high frequency. This starter archives each market event in R2 and updates only the latest-per-symbol row in D1. For production, aggregate ticks into candles before storing analytics in D1.
-- Queue `warroom-trade-commands` is provisioned but has no consumer or order sender in Phase 1. Later, Windows can use an HTTP pull consumer for commands, with a separate restricted Cloudflare API token. The Windows bridge must validate account, environment, expiry, idempotency key, symbol, risk approval, and kill-switch before forwarding any command to MT5.
-- Durable Object pause/resume/kill endpoints in Phase 1 control system state only. They do not close broker positions or enable execution.
+- The bridge archives market events in R2, retains a bounded tick-observation history for Risk Check, and stores only the latest completed scanner candle snapshot per symbol/timeframe in PostgreSQL. Keep bridge batches bounded when adding more instruments.
+- Queue `warroom-trade-commands` remains provisioned but unused. The Executor
+  uses PostgreSQL `trade_intents` and a separate-key HTTP pull/ack flow. It
+  chooses the top-scoring eligible timeframe per symbol, sends one command at a
+  time, validates the demo account, expiry, current spread and risk, position
+  limits, and broker constraints, and does not replay dispatched commands.
+- Durable Object pause/resume/kill controls gate new intents and claims. They do
+  not close broker positions; trailing stops, modification, and closing remain
+  deferred.
 - Cron schedules use UTC.
 - Use Cloudflare Access or another strong authentication layer for the dashboard before exposing it publicly. The static dashboard is a starter UI; its admin buttons prompt for the API key and should be replaced with a proper Access-protected session flow before production.

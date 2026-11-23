@@ -1,6 +1,13 @@
-import { STRATEGY, STRATEGY_VERSION } from "./scanner.ts";
+import {
+  STRATEGY,
+  STRATEGY_VERSION,
+  type ScannerTimeframe
+} from "./scanner.ts";
 
-export type SizingDecision = "SIZED_FOR_PAPER_REVIEW" | "REJECTED";
+export type SizingDecision =
+  | "SIZED_FOR_PAPER_REVIEW"
+  | "SIZED_FOR_DEMO_EXECUTION"
+  | "REJECTED";
 
 export interface M1Candle {
   time: string;
@@ -12,6 +19,7 @@ export interface M1Candle {
 export interface SizingSymbolSpec {
   tick_size: number;
   tick_value_loss: number;
+  contract_size: number;
   volume_min: number;
   volume_max: number;
   volume_step: number;
@@ -20,6 +28,7 @@ export interface SizingSymbolSpec {
 export interface SizingCandidate {
   signal_id: string;
   symbol: string;
+  timeframe: ScannerTimeframe | "M1";
   strategy: string;
   strategy_version: string;
   state: string;
@@ -60,6 +69,7 @@ export interface PositionSizerInput {
 export interface PositionSizerResult {
   signal_id: string;
   symbol: string;
+  timeframe: ScannerTimeframe | "M1";
   strategy: string;
   strategy_version: string;
   direction: "BUY" | "SELL";
@@ -69,10 +79,12 @@ export interface PositionSizerResult {
     atr14_m1: number | null;
     entry_price: number | null;
     stop_loss_price: number | null;
+    take_profit_price: number | null;
     risk_pct_limit: number;
     equity: number | null;
     risk_budget: number | null;
     risk_per_lot: number | null;
+    contract_size: number | null;
     raw_volume: number | null;
     volume: number | null;
     estimated_loss: number | null;
@@ -91,6 +103,7 @@ export const DEFAULT_POSITION_SIZER_CONFIG = {
 } as const;
 
 export const MAX_ALLOWED_RISK_PCT = 0.25;
+export const TAKE_PROFIT_R_MULTIPLE = 2;
 const REQUIRED_CANDLES = DEFAULT_POSITION_SIZER_CONFIG.atrPeriod * 2 + 1;
 
 function isFresh(timestamp: string, nowMs: number, staleSeconds: number): boolean {
@@ -191,10 +204,12 @@ export function sizePosition(
     atr14_m1: null,
     entry_price: null,
     stop_loss_price: null,
+    take_profit_price: null,
     risk_pct_limit: input.riskPct,
     equity: null,
     risk_budget: null,
     risk_per_lot: null,
+    contract_size: null,
     raw_volume: null,
     volume: null,
     estimated_loss: null,
@@ -210,7 +225,7 @@ export function sizePosition(
     input.riskPct <= MAX_ALLOWED_RISK_PCT;
 
   if (!input.risk.eligible || !isFresh(input.risk.checked_at, input.nowMs, input.staleSeconds)) {
-    reject("A fresh ELIGIBLE_FOR_PAPER_REVIEW Risk Checker result is required");
+    reject("A fresh eligible Risk Checker result is required");
   }
   if (
     candidate.strategy !== STRATEGY ||
@@ -222,8 +237,8 @@ export function sizePosition(
   if (!validRiskPct) {
     reject(`Per-trade risk must be greater than 0 and no more than ${MAX_ALLOWED_RISK_PCT}%`);
   }
-  if (!input.paperMode || input.tradingEnabled) {
-    reject("Position Sizer requires PAPER_MODE=true and TRADING_ENABLED=false");
+  if (!input.paperMode) {
+    reject("PAPER_MODE=true is required for demo sizing");
   }
   if (
     !input.bridge ||
@@ -285,15 +300,24 @@ export function sizePosition(
           direction === "BUY"
             ? metrics.entry_price - stopDistance
             : metrics.entry_price + stopDistance;
+        metrics.take_profit_price =
+          direction === "BUY"
+            ? metrics.entry_price + stopDistance * TAKE_PROFIT_R_MULTIPLE
+            : metrics.entry_price - stopDistance * TAKE_PROFIT_R_MULTIPLE;
       }
     }
 
     const spec = snapshot.spec;
+    metrics.contract_size = Number.isFinite(spec.contract_size)
+      ? spec.contract_size
+      : null;
     if (
       !Number.isFinite(spec.tick_size) ||
       spec.tick_size <= 0 ||
       !Number.isFinite(spec.tick_value_loss) ||
       spec.tick_value_loss <= 0 ||
+      !Number.isFinite(spec.contract_size) ||
+      spec.contract_size <= 0 ||
       !Number.isFinite(spec.volume_min) ||
       spec.volume_min <= 0 ||
       !Number.isFinite(spec.volume_max) ||
@@ -309,6 +333,11 @@ export function sizePosition(
     ) {
       if (metrics.stop_loss_price <= 0) {
         reject("Calculated stop-loss price is invalid");
+      } else if (
+        metrics.take_profit_price === null ||
+        metrics.take_profit_price <= 0
+      ) {
+        reject("Calculated take-profit price is invalid");
       } else {
         const priceDistance = Math.abs(
           metrics.entry_price - metrics.stop_loss_price
@@ -362,10 +391,15 @@ export function sizePosition(
   return {
     signal_id: candidate.signal_id,
     symbol: candidate.symbol,
+    timeframe: candidate.timeframe,
     strategy: candidate.strategy,
     strategy_version: candidate.strategy_version,
     direction,
-    decision: reasons.length ? "REJECTED" : "SIZED_FOR_PAPER_REVIEW",
+    decision: reasons.length
+      ? "REJECTED"
+      : input.tradingEnabled
+        ? "SIZED_FOR_DEMO_EXECUTION"
+        : "SIZED_FOR_PAPER_REVIEW",
     reasons,
     metrics,
     as_of: candidate.as_of,

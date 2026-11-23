@@ -1,5 +1,12 @@
+import type { Database } from "./postgres";
+import type {
+  Candle,
+  ScannerTimeframe
+} from "./scanner";
+
 export interface Env {
-  DB: D1Database;
+  DB: Database;
+  HYPERDRIVE: Hyperdrive;
   MARKET_INGEST: Queue;
   AGENT_TASKS: Queue;
   TRADE_COMMANDS: Queue;
@@ -7,6 +14,7 @@ export interface Env {
   ACCOUNT_COORDINATOR: DurableObjectNamespace;
   ASSETS: Fetcher;
   WARROOM_API_KEY: string;
+  EXECUTOR_API_KEY?: string;
   TELEGRAM_BOT_TOKEN?: string;
   TELEGRAM_CHAT_ID?: string;
   APP_ENV: string;
@@ -83,6 +91,7 @@ export interface SizingInputSymbol {
   spec: {
     tick_size: number;
     tick_value_loss: number;
+    contract_size: number;
     volume_min: number;
     volume_max: number;
     volume_step: number;
@@ -92,4 +101,21 @@ export interface SizingInputSymbol {
 export interface SizingInputsPayload {
   captured_at: string;
   symbols: SizingInputSymbol[];
+}
+
+export interface ScannerCandleFrame {
+  timeframe: ScannerTimeframe;
+  available: boolean;
+  error?: string | null;
+  candles: Candle[];
+}
+
+export interface ScannerCandleSymbol {
+  symbol: string;
+  timeframes: ScannerCandleFrame[];
+}
+
+export interface ScannerCandlesPayload {
+  captured_at: string;
+  symbols: ScannerCandleSymbol[];
 }

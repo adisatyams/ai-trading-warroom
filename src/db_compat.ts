@@ -1,3 +1,5 @@
+import type { Database } from "./postgres";
+
 type CompatibleTable =
   | "agent_status"
   | "market_latest"
@@ -6,17 +8,14 @@ type CompatibleTable =
   | "equity_snapshots";
 
 export async function tableColumns(
-  db: D1Database,
+  db: Database,
   table: CompatibleTable
 ): Promise<Set<string>> {
-  const statements: Record<CompatibleTable, string> = {
-    agent_status: "PRAGMA table_info(agent_status)",
-    market_latest: "PRAGMA table_info(market_latest)",
-    system_events: "PRAGMA table_info(system_events)",
-    instruments: "PRAGMA table_info(instruments)",
-    equity_snapshots: "PRAGMA table_info(equity_snapshots)"
-  };
-  const rows = await db.prepare(statements[table]).all<{ name: string }>();
+  const rows = await db.prepare(`
+    SELECT column_name AS name
+    FROM information_schema.columns
+    WHERE table_schema = current_schema() AND table_name = ?
+  `).bind(table).all<{ name: string }>();
   return new Set(rows.results.map(row => row.name));
 }
 
@@ -198,7 +197,7 @@ export function scannerAgentStatusUpdate(
 }
 
 export async function insertSystemEvent(
-  db: D1Database,
+  db: Database,
   event: {
     level: string;
     event_type: string;
