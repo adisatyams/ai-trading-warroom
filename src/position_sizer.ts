@@ -4,7 +4,10 @@ import {
   type ScannerTimeframe
 } from "./scanner.ts";
 
-export type SizingDecision = "SIZED_FOR_PAPER_REVIEW" | "REJECTED";
+export type SizingDecision =
+  | "SIZED_FOR_PAPER_REVIEW"
+  | "SIZED_FOR_DEMO_EXECUTION"
+  | "REJECTED";
 
 export interface M1Candle {
   time: string;
@@ -222,7 +225,7 @@ export function sizePosition(
     input.riskPct <= MAX_ALLOWED_RISK_PCT;
 
   if (!input.risk.eligible || !isFresh(input.risk.checked_at, input.nowMs, input.staleSeconds)) {
-    reject("A fresh ELIGIBLE_FOR_PAPER_REVIEW Risk Checker result is required");
+    reject("A fresh eligible Risk Checker result is required");
   }
   if (
     candidate.strategy !== STRATEGY ||
@@ -234,8 +237,8 @@ export function sizePosition(
   if (!validRiskPct) {
     reject(`Per-trade risk must be greater than 0 and no more than ${MAX_ALLOWED_RISK_PCT}%`);
   }
-  if (!input.paperMode || input.tradingEnabled) {
-    reject("Position Sizer requires PAPER_MODE=true and TRADING_ENABLED=false");
+  if (!input.paperMode) {
+    reject("PAPER_MODE=true is required for demo sizing");
   }
   if (
     !input.bridge ||
@@ -392,7 +395,11 @@ export function sizePosition(
     strategy: candidate.strategy,
     strategy_version: candidate.strategy_version,
     direction,
-    decision: reasons.length ? "REJECTED" : "SIZED_FOR_PAPER_REVIEW",
+    decision: reasons.length
+      ? "REJECTED"
+      : input.tradingEnabled
+        ? "SIZED_FOR_DEMO_EXECUTION"
+        : "SIZED_FOR_PAPER_REVIEW",
     reasons,
     metrics,
     as_of: candidate.as_of,

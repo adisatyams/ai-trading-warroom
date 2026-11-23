@@ -128,6 +128,16 @@ test("uses bid and an upward stop for SELL signals", () => {
   assert.equal(result.metrics.take_profit_price, 96);
 });
 
+test("demo sizing remains constrained by the demo heartbeat and risk cap", () => {
+  const result = sizePosition(
+    candidate(),
+    input({ tradingEnabled: true })
+  );
+  assert.equal(result.decision, "SIZED_FOR_DEMO_EXECUTION");
+  assert.equal(result.execution_enabled, false);
+  assert.ok(result.metrics.estimated_risk_pct! <= 0.25);
+});
+
 test("rejects stale inputs, non-eligible risk results, and unsafe execution mode", () => {
   const staleSnapshot = input({
     snapshot: {

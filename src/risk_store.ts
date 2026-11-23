@@ -1,6 +1,6 @@
 import type { Env } from "./types";
 import type { DatabaseStatement } from "./postgres";
-import { agentStatusUpdate, tableColumns } from "./db_compat";
+import { agentStatusUpdate, tableColumns } from "./db_compat.ts";
 import {
   DEFAULT_RISK_CONFIG,
   evaluateRisk,
@@ -10,9 +10,9 @@ import {
   type RiskContext,
   type RiskConfig,
   type RiskResult
-} from "./risk_checker";
-import type { Observation } from "./scanner";
-import { STRATEGY, STRATEGY_VERSION } from "./scanner";
+} from "./risk_checker.ts";
+import type { Observation } from "./scanner.ts";
+import { STRATEGY, STRATEGY_VERSION } from "./scanner.ts";
 
 const RISK_RESULT_RETENTION_DAYS = 14;
 const POSITION_RETENTION_HOURS = 48;
@@ -35,6 +35,20 @@ export function riskConfig(env: Env): RiskConfig {
   const stale = Number(env.BRIDGE_STALE_SECONDS);
   const dailyLoss = Number(env.MAX_DAILY_LOSS_PCT);
   const drawdown = Number(env.MAX_DRAWDOWN_PCT);
+  if (
+    env.MAX_DAILY_LOSS_PCT !== undefined &&
+    env.MAX_DAILY_LOSS_PCT !== "" &&
+    (!Number.isFinite(dailyLoss) || dailyLoss <= 0)
+  ) {
+    throw new Error("MAX_DAILY_LOSS_PCT must be positive");
+  }
+  if (
+    env.MAX_DRAWDOWN_PCT !== undefined &&
+    env.MAX_DRAWDOWN_PCT !== "" &&
+    (!Number.isFinite(drawdown) || drawdown <= 0)
+  ) {
+    throw new Error("MAX_DRAWDOWN_PCT must be positive");
+  }
   return {
     ...DEFAULT_RISK_CONFIG,
     staleSeconds:
@@ -125,6 +139,38 @@ export async function savePositionSnapshot(
       position.direction,
       position.volume
     ));
+  }
+
+  const snapshotAgeMs = Date.now() - Date.parse(batch.captured_at);
+  if (snapshotAgeMs >= 0 && snapshotAgeMs <= riskConfig(env).staleSeconds * 1000) {
+    const closeEligibleBefore = new Date(
+      Date.parse(batch.captured_at) - 60_000
+    ).toISOString();
+    statements.push(env.DB.prepare(`
+      UPDATE trade_intents
+      SET status = 'CLOSED'
+      WHERE status IN ('EXECUTED', 'PARTIAL')
+        AND intent_id IN (
+          SELECT trade_id
+          FROM trade_history
+          WHERE opened_at IS NOT NULL AND opened_at <= ?
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM risk_open_positions
+          WHERE snapshot_id = ? AND symbol = trade_intents.symbol
+        )
+    `).bind(closeEligibleBefore, snapshotId));
+    statements.push(env.DB.prepare(`
+      UPDATE trade_history
+      SET status = 'CLOSED', closed_at = ?
+      WHERE closed_at IS NULL
+        AND trade_id IN (
+          SELECT intent_id
+          FROM trade_intents
+          WHERE status = 'CLOSED'
+        )
+    `).bind(batch.captured_at));
   }
 
   await env.DB.batch(statements);
@@ -309,7 +355,12 @@ function saveRiskResult(
 export async function checkLatestSignals(
   env: Env,
   symbols: string[]
-): Promise<{ evaluated: number; eligible_for_paper_review: number; rejected: number }> {
+): Promise<{
+  evaluated: number;
+  eligible_for_paper_review: number;
+  eligible_for_demo_execution: number;
+  rejected: number;
+}> {
   const uniqueSymbols = [...new Set(symbols)];
   const results: RiskResult[] = [];
   const nowMs = Date.now();
@@ -405,6 +456,9 @@ export async function checkLatestSignals(
     eligible_for_paper_review: results.filter(
       result => result.decision === "ELIGIBLE_FOR_PAPER_REVIEW"
     ).length,
+    eligible_for_demo_execution: results.filter(
+      result => result.decision === "ELIGIBLE_FOR_DEMO_EXECUTION"
+    ).length,
     rejected: results.filter(result => result.decision === "REJECTED").length
   };
 }
@@ -475,6 +529,7 @@ export async function riskStatus(env: Env) {
 
   const summary = {
     ELIGIBLE_FOR_PAPER_REVIEW: 0,
+    ELIGIBLE_FOR_DEMO_EXECUTION: 0,
     REJECTED: 0,
     STALE: 0
   };

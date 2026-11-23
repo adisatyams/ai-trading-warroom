@@ -5,7 +5,10 @@ import {
   type Observation
 } from "./scanner.ts";
 
-export type RiskDecision = "ELIGIBLE_FOR_PAPER_REVIEW" | "REJECTED";
+export type RiskDecision =
+  | "ELIGIBLE_FOR_PAPER_REVIEW"
+  | "ELIGIBLE_FOR_DEMO_EXECUTION"
+  | "REJECTED";
 
 export interface RiskCandidate {
   signal_id: string;
@@ -299,8 +302,8 @@ export function evaluateRisk(
     pass("signal_freshness");
   }
 
-  if (!context.paperMode || context.tradingEnabled) {
-    reject("safety", "Risk Checker requires PAPER_MODE=true and TRADING_ENABLED=false");
+  if (!context.paperMode) {
+    reject("safety", "PAPER_MODE=true is required for demo execution");
   } else {
     pass("safety");
   }
@@ -459,7 +462,9 @@ export function evaluateRisk(
     scanner_state: candidate.state,
     decision: reasons.length
       ? "REJECTED"
-      : "ELIGIBLE_FOR_PAPER_REVIEW",
+      : context.tradingEnabled
+        ? "ELIGIBLE_FOR_DEMO_EXECUTION"
+        : "ELIGIBLE_FOR_PAPER_REVIEW",
     reasons,
     checks,
     metrics: {

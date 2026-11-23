@@ -151,7 +151,9 @@ export async function sizeEligibleSignals(
     : [];
   const eligibleRiskRows = riskRows.filter(
     (row): row is NonNullable<typeof row> => row !== null &&
-    row.decision === "ELIGIBLE_FOR_PAPER_REVIEW" &&
+    row.decision === (env.TRADING_ENABLED === "true"
+      ? "ELIGIBLE_FOR_DEMO_EXECUTION"
+      : "ELIGIBLE_FOR_PAPER_REVIEW") &&
     isFresh(row.checked_at, nowMs, config.staleSeconds)
   );
   const skippedRisk = riskRows.length - eligibleRiskRows.length;
@@ -264,7 +266,7 @@ export async function sizeEligibleSignals(
     "SIZER",
     new Date(nowMs).toISOString(),
     STRATEGY,
-    `${STRATEGY} v${STRATEGY_VERSION}: M1 ATR(14), stop 2x ATR, TP ${TAKE_PROFIT_R_MULTIPLE}R, max ${MAX_ALLOWED_RISK_PCT}% equity risk; no order path`
+    `${STRATEGY} v${STRATEGY_VERSION}: M1 ATR(14), stop 2x ATR, TP ${TAKE_PROFIT_R_MULTIPLE}R, max ${MAX_ALLOWED_RISK_PCT}% equity risk; sizing only, Executor separately gated`
   );
   if (statusUpdate) {
     await env.DB.prepare(statusUpdate.sql)
@@ -275,7 +277,9 @@ export async function sizeEligibleSignals(
   return {
     evaluated: results.length,
     sized: results.filter(
-      result => result.decision === "SIZED_FOR_PAPER_REVIEW"
+      result =>
+        result.decision === "SIZED_FOR_PAPER_REVIEW" ||
+        result.decision === "SIZED_FOR_DEMO_EXECUTION"
     ).length,
     rejected: results.filter(result => result.decision === "REJECTED").length,
     skipped_risk: skippedRisk
@@ -341,6 +345,7 @@ export async function positionSizerStatus(env: Env) {
   const nowMs = Date.now();
   const sizedSummary = {
     SIZED_FOR_PAPER_REVIEW: 0,
+    SIZED_FOR_DEMO_EXECUTION: 0,
     REJECTED: 0,
     STALE: 0
   };

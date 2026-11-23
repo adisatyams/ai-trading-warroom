@@ -21,6 +21,36 @@ interface PgClient {
   end(): Promise<void>;
 }
 
+function isTransientPostgresError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const message = error.message.toLowerCase();
+  return (
+    message.includes("timed out") ||
+    message.includes("open slot") ||
+    message.includes("connection terminated unexpectedly") ||
+    message.includes("connection reset") ||
+    message.includes("temporarily unavailable")
+  );
+}
+
+async function retryTransientPostgres<T>(
+  operation: () => Promise<T>
+): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (!isTransientPostgresError(error) || attempt === 2) throw error;
+      await new Promise(resolve =>
+        setTimeout(resolve, 250 * (attempt + 1))
+      );
+    }
+  }
+  throw lastError;
+}
+
 export function postgresPlaceholders(sql: string): string {
   let output = "";
   let parameter = 0;
@@ -115,16 +145,18 @@ class PostgresStatement implements DatabaseStatement {
   }
 
   private async query() {
-    const client = new Client({
-      connectionString: this.connectionString,
-      connectionTimeoutMillis: 5_000
+    return retryTransientPostgres(async () => {
+      const client = new Client({
+        connectionString: this.connectionString,
+        connectionTimeoutMillis: 5_000
+      });
+      await client.connect();
+      try {
+        return await client.query(postgresPlaceholders(this.sql), this.values);
+      } finally {
+        await client.end();
+      }
     });
-    await client.connect();
-    try {
-      return await client.query(postgresPlaceholders(this.sql), this.values);
-    } finally {
-      await client.end();
-    }
   }
 }
 
@@ -140,35 +172,37 @@ export class PostgresDatabase implements Database {
   }
 
   async batch(statements: DatabaseStatement[]): Promise<unknown[]> {
-    const client = new Client({
-      connectionString: this.connectionString,
-      connectionTimeoutMillis: 5_000
-    });
-    await client.connect();
-    try {
-      await client.query("BEGIN");
-      const results: unknown[] = [];
-      for (const statement of statements) {
-        if (!(statement instanceof PostgresStatement)) {
-          throw new TypeError("PostgreSQL batch received a foreign statement");
-        }
-        results.push(await statement.execute(client));
-      }
-      await client.query("COMMIT");
-      return results;
-    } catch (error) {
+    return retryTransientPostgres(async () => {
+      const client = new Client({
+        connectionString: this.connectionString,
+        connectionTimeoutMillis: 5_000
+      });
+      await client.connect();
       try {
-        await client.query("ROLLBACK");
-      } catch (rollbackError) {
-        console.error(
-          "POSTGRES_BATCH_ROLLBACK_FAILURE",
-          rollbackError instanceof Error ? rollbackError.message : String(rollbackError)
-        );
+        await client.query("BEGIN");
+        const results: unknown[] = [];
+        for (const statement of statements) {
+          if (!(statement instanceof PostgresStatement)) {
+            throw new TypeError("PostgreSQL batch received a foreign statement");
+          }
+          results.push(await statement.execute(client));
+        }
+        await client.query("COMMIT");
+        return results;
+      } catch (error) {
+        try {
+          await client.query("ROLLBACK");
+        } catch (rollbackError) {
+          console.error(
+            "POSTGRES_BATCH_ROLLBACK_FAILURE",
+            rollbackError instanceof Error ? rollbackError.message : String(rollbackError)
+          );
+        }
+        throw error;
+      } finally {
+        await client.end();
       }
-      throw error;
-    } finally {
-      await client.end();
-    }
+    });
   }
 }
 

@@ -14,6 +14,7 @@ export interface Env {
   ACCOUNT_COORDINATOR: DurableObjectNamespace;
   ASSETS: Fetcher;
   WARROOM_API_KEY: string;
+  EXECUTOR_API_KEY?: string;
   TELEGRAM_BOT_TOKEN?: string;
   TELEGRAM_CHAT_ID?: string;
   APP_ENV: string;

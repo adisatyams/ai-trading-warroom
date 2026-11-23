@@ -25,15 +25,17 @@
     "consumers": [
       {
         "queue": "warroom-market-ingest",
-        "max_batch_size": 10,
+        "max_batch_size": 5,
         "max_batch_timeout": 5,
+        "max_concurrency": 1,
         "max_retries": 5,
         "dead_letter_queue": "warroom-market-dlq"
       },
       {
         "queue": "warroom-agent-tasks",
-        "max_batch_size": 10,
+        "max_batch_size": 5,
         "max_batch_timeout": 2,
+        "max_concurrency": 1,
         "max_retries": 5,
         "dead_letter_queue": "warroom-agent-dlq"
       }
@@ -55,7 +57,7 @@
   },
   "vars": {
     "APP_ENV": "production",
-    "TRADING_ENABLED": "false",
+    "TRADING_ENABLED": "true",
     "PAPER_MODE": "true",
     "MAX_RISK_PER_TRADE_PCT": "0.25",
     "MAX_DAILY_LOSS_PCT": "2.0",

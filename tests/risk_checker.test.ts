@@ -7,6 +7,7 @@ import {
   type RiskContext
 } from "../src/risk_checker.ts";
 import { STRATEGY, STRATEGY_VERSION, type Observation } from "../src/scanner.ts";
+import { riskConfig } from "../src/risk_store.ts";
 
 const NOW = Date.parse("2026-11-20T12:00:00.000Z");
 const ISO_NOW = new Date(NOW).toISOString();
@@ -79,6 +80,16 @@ test("eligible output is limited to paper review and requires all fresh inputs",
   assert.deepEqual(result.reasons, []);
   assert.equal(result.execution_enabled, false);
   assert.ok(Object.values(result.checks).every(Boolean));
+});
+
+test("demo execution eligibility requires the same complete risk checks", () => {
+  const result = evaluateRisk(
+    candidate(),
+    context({ tradingEnabled: true })
+  );
+  assert.equal(result.decision, "ELIGIBLE_FOR_DEMO_EXECUTION");
+  assert.equal(result.execution_enabled, false);
+  assert.deepEqual(result.reasons, []);
 });
 
 test("rejects a spread above the symbol limit", () => {
@@ -229,4 +240,15 @@ test("rejects stale inputs, unapproved strategy, and unsafe execution mode", () 
 test("uses the configured daily loss and drawdown thresholds", () => {
   assert.equal(DEFAULT_RISK_CONFIG.maxDailyLossPct, 2);
   assert.equal(DEFAULT_RISK_CONFIG.maxDailyDrawdownPct, 3);
+});
+
+test("invalid configured daily loss or drawdown fails closed", () => {
+  assert.throws(
+    () => riskConfig({ MAX_DAILY_LOSS_PCT: "-1" } as any),
+    /MAX_DAILY_LOSS_PCT/
+  );
+  assert.throws(
+    () => riskConfig({ MAX_DRAWDOWN_PCT: "not-a-number" } as any),
+    /MAX_DRAWDOWN_PCT/
+  );
 });

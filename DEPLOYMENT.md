@@ -8,8 +8,11 @@
 - R2 archives raw market events in JSONL batches.
 - Durable Object holds per-account pause/kill-switch state.
 - Cron checks Windows bridge heartbeat.
-- Windows VPS runs MT5 and a telemetry-only Python bridge.
-- Trade execution is deliberately locked; `/api/v1/trading/execute` is not implemented as an order sender.
+- Windows VPS runs MT5 and the Python bridge, which can submit demo-only market
+  orders when separately armed.
+- Execution is locked by default. The disabled `/api/v1/trading/execute` route
+  is not an order sender; the demo Executor uses a separate authenticated pull
+  and acknowledgement API.
 
 ## Prerequisites
 - Cloudflare account with Workers, Hyperdrive, Queues and R2 enabled.
@@ -51,8 +54,9 @@ Remove the `d1_databases` section when the Hyperdrive binding is available.
 This deployment starts with an empty Aiven database; D1 records are not copied.
 Apply `postgres/001_initial_schema.sql` using the Aiven console or `psql`.
 For an existing database already initialized with 001, apply
-`postgres/002_multi_timeframe_scanner.sql` before deploying this scanner
-version. Fresh databases may apply 001 directly.
+`postgres/002_multi_timeframe_scanner.sql` and then
+`postgres/003_executor.sql`. Fresh databases should apply 001, 002, and 003 in
+order before deploying.
 Keep the connection URL in a secure environment variable or password manager;
 never commit or print it.
 
@@ -68,10 +72,14 @@ npx wrangler deploy --dry-run
 ## 4. Configure secrets
 ```bash
 npx wrangler secret put WARROOM_API_KEY
+npx wrangler secret put EXECUTOR_API_KEY
 npx wrangler secret put TELEGRAM_BOT_TOKEN
 npx wrangler secret put TELEGRAM_CHAT_ID
 ```
-For API key, generate a long random value locally, then paste it into Wrangler and the Windows bridge `.env.windows`. Telegram secrets can be left unset until Telegram is configured. Never commit secrets.
+Generate separate long random values for `WARROOM_API_KEY` and
+`EXECUTOR_API_KEY`. Put the matching values into Wrangler and the Windows
+bridge `.env.windows`; never reuse or commit secrets. Telegram secrets can be
+left unset until Telegram is configured.
 
 ## 5. Deploy
 ```bash
@@ -100,26 +108,40 @@ Set `WARROOM_API_URL` to the deployed Worker URL, `WARROOM_API_KEY` to the secre
 - Dashboard shows agents, heartbeat, and market symbols.
 - `GET /api/v1/system/config` reports `execution_enabled:false`.
 - `POST /api/v1/trading/execute` is not an active order route; execution remains locked.
+- `GET /api/v1/executor/status` reports the Worker gate, demo heartbeat, and
+  account pause/kill state. By default, the account begins paused and both
+  trading flags are false.
 - `GET /api/v1/scanner/status` and `GET /api/v1/scanner/latest` (both require the `x-api-key` header). The scanner warms up after MT5 sends at least 200 completed candles per timeframe.
 - `GET /api/v1/bridge/status` returns liveness only (no account login, server, balance or equity).
 
 ## Deterministic scanner (MULTI_TIMEFRAME_INDICATORS_V1)
 
-Research-only: it produces a separate result for each visible MT5 symbol and
+It produces a separate result for each visible MT5 symbol and
 M5/M15/H1/H4 timeframe from completed candles, using EMA(20/50/200),
 MACD(12/26/9), RSI(14), ATR(14), and Bollinger Bands(20, 2). The rule score is
 weighted 25/25/15/20/15 with a 70-point candidate threshold; it is a heuristic,
 not a probability of profit. Hypothetical SL uses 2x M1 ATR(14) and TP is 2R.
 The bridge discovers all instruments visible in MT5 Market Watch and chunks its
-market, candle, and sizing payloads to the Worker limits. It has no path to the
-executor; `TRADING_ENABLED=false` and `PAPER_MODE=true` must stay set. Tick
-observations are retained for 48 hours and scan results for 14 days (pruned by
-the cron trigger).
+market, candle, and sizing payloads to the Worker limits. Scanner signals alone
+never send orders. The Executor requires a fresh demo heartbeat, passing Risk
+Checker and Sizer results, an unpaused account, and both Worker
+`TRADING_ENABLED` and local `MT5_TRADING_ENABLED` set to `true`. The repository
+defaults remain `TRADING_ENABLED=false`, `PAPER_MODE=true`, and
+`MT5_TRADING_ENABLED=false`; do not change them until explicitly ready to arm a
+demo terminal. Before arming, use the authenticated `/api/v1/control/resume`
+route; a latched kill switch continues to block execution. Tick observations are
+retained for 48 hours and scan results for 14 days (pruned by the cron trigger).
 
 ## Notes on the architecture
 - Queue delivery can retry. Consumers must be idempotent; never treat a queue delivery as proof that a broker order has executed.
 - The bridge archives market events in R2, retains a bounded tick-observation history for Risk Check, and stores only the latest completed scanner candle snapshot per symbol/timeframe in PostgreSQL. Keep bridge batches bounded when adding more instruments.
-- Queue `warroom-trade-commands` is provisioned but has no consumer or order sender in Phase 1. Later, Windows can use an HTTP pull consumer for commands, with a separate restricted Cloudflare API token. The Windows bridge must validate account, environment, expiry, idempotency key, symbol, risk approval, and kill-switch before forwarding any command to MT5.
-- Durable Object pause/resume/kill endpoints in Phase 1 control system state only. They do not close broker positions or enable execution.
+- Queue `warroom-trade-commands` remains provisioned but unused. The Executor
+  uses PostgreSQL `trade_intents` and a separate-key HTTP pull/ack flow. It
+  chooses the top-scoring eligible timeframe per symbol, sends one command at a
+  time, validates the demo account, expiry, current spread and risk, position
+  limits, and broker constraints, and does not replay dispatched commands.
+- Durable Object pause/resume/kill controls gate new intents and claims. They do
+  not close broker positions; trailing stops, modification, and closing remain
+  deferred.
 - Cron schedules use UTC.
 - Use Cloudflare Access or another strong authentication layer for the dashboard before exposing it publicly. The static dashboard is a starter UI; its admin buttons prompt for the API key and should be replaced with a proper Access-protected session flow before production.
