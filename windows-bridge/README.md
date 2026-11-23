@@ -77,7 +77,8 @@ never automatically retried after dispatch.
 
 ## Executor activation and API
 
-The repository defaults remain locked: `TRADING_ENABLED=false` in Wrangler and
+The Worker gate is open by default (`TRADING_ENABLED=true` in Wrangler) for the
+demo observation run, but the bridge stays locked with
 `MT5_TRADING_ENABLED=false` in `.env.windows.example`. Position management is
 not enabled: trailing stops, modification, and closing are deferred.
 
@@ -93,8 +94,8 @@ Before any activation:
    `/api/v1/control/resume` route to clear the pause. A latched kill switch
    blocks execution and makes `/resume` return 409 until it is cleared with
    `/api/v1/control/reset-kill` (which leaves the account paused).
-5. To explicitly arm demo orders later, set both Worker `TRADING_ENABLED=true`
-   and bridge `MT5_TRADING_ENABLED=true`. Either gate being false prevents
+5. To arm demo orders, Worker `TRADING_ENABLED=true` (already the default) and
+   bridge `MT5_TRADING_ENABLED=true` in `.env.windows` must both be set. Either gate being false prevents
    order dispatch.
 
 - `GET /api/v1/executor/status` reports the Worker gate, demo heartbeat, and

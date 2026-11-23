@@ -127,14 +127,16 @@ market, candle, and sizing payloads to the Worker limits. Scanner signals alone
 never send orders. The Executor requires a fresh demo heartbeat, passing Risk
 Checker and Sizer results, an unpaused account, and both Worker
 `TRADING_ENABLED` and local `MT5_TRADING_ENABLED` set to `true`. The repository
-defaults remain `TRADING_ENABLED=false`, `PAPER_MODE=true`, and
-`MT5_TRADING_ENABLED=false`; do not change them until explicitly ready to arm a
-demo terminal. Before arming, use the authenticated `/api/v1/control/resume`
+Wrangler default is now `TRADING_ENABLED=true` (the Worker gate is open so the
+demo run can be observed), while `PAPER_MODE=true` and the bridge's
+`MT5_TRADING_ENABLED=false` remain; orders still require the bridge gate, an
+unpaused account and a demo-account check. Set `TRADING_ENABLED` back to
+`false` to lock the Worker side. Before arming, use the authenticated `/api/v1/control/resume`
 route; a latched kill switch blocks execution and `/resume` is refused (HTTP
 409) until it is cleared with `POST /api/v1/control/reset-kill`, which leaves the
 account paused. Every pause/resume/kill/reset-kill is written to `system_events`
-(`ACCOUNT_*`) and shows up in the Logger. To arm a deployment explicitly, use
-`npx wrangler deploy --var TRADING_ENABLED:true` (the file default stays `false`).
+(`ACCOUNT_*`) and shows up in the Logger. To lock the Worker side again, use
+`npx wrangler deploy --var TRADING_ENABLED:false`.
 Tick observations are
 retained for 48 hours and scan results for 14 days (pruned by the cron trigger).
 
