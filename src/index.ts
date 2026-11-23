@@ -47,7 +47,9 @@ import {
   claimTradeIntents,
   enqueueEligibleTrades,
   executorStatus,
-  validExecutorAck
+  resolveUncertainIntent,
+  validExecutorAck,
+  validResolveRequest
 } from "./executor";
 import {
   loggerEvents,
@@ -331,6 +333,42 @@ export default {
         return json(await executorStatus(env));
       }
 
+      // Operator reconciliation of an UNCERTAIN intent (WARROOM_API_KEY via
+      // the generic POST auth above). Releases or records the symbol lock.
+      if (
+        url.pathname === "/api/v1/executor/intents/resolve" &&
+        request.method === "POST"
+      ) {
+        let body: unknown;
+        try {
+          const bytes = await request.arrayBuffer();
+          if (bytes.byteLength > 16 * 1024) {
+            return json({ error: "Payload too large" }, 413);
+          }
+          body = JSON.parse(new TextDecoder().decode(bytes));
+        } catch {
+          return json({ error: "Invalid JSON" }, 400);
+        }
+        if (!validResolveRequest(body)) {
+          return json({
+            error: "Invalid resolve request: intent_id and resolution (NO_FILL | FILLED) are required; FILLED also needs broker_ticket, volume and entry_price"
+          }, 422);
+        }
+        const result = await resolveUncertainIntent(env, body);
+        if (!result.resolved) {
+          return json(
+            { error: result.reason, code: result.code },
+            result.code === "NOT_FOUND" ? 404 : 409
+          );
+        }
+        return json({
+          resolved: true,
+          intent_id: body.intent_id,
+          status: result.status,
+          execution_enabled: false
+        });
+      }
+
       if (
         url.pathname === "/api/v1/logger/events" &&
         request.method === "GET"
@@ -458,6 +496,7 @@ export default {
             executor_key_configured: !!env.EXECUTOR_API_KEY,
             active_intents: 0,
             intents: {},
+            uncertain_intents: [],
             position_management: {
               trailing_stop: false,
               modification: false,
@@ -1190,17 +1229,46 @@ export default {
         const action = url.pathname.split("/").pop();
 
         if (
-          !["pause", "resume", "kill"].includes(action || "")
+          !["pause", "resume", "kill", "reset-kill"].includes(action || "")
         ) {
           return json({ error: "Unknown action" }, 404);
         }
 
         const stub = await coordinator(env);
 
-        return await stub.fetch(
+        const response = await stub.fetch(
           "https://coordinator/" + action,
           { method: "POST" }
         );
+
+        // Audit every control action (applied or rejected) so the Logger
+        // timeline shows who/when. An audit failure must not mask the result.
+        try {
+          await insertSystemEvent(env.DB, {
+            level:
+              action === "kill"
+                ? "ERROR"
+                : action === "reset-kill"
+                  ? "WARN"
+                  : "INFO",
+            event_type: `ACCOUNT_${String(action).toUpperCase().replace("-", "_")}`,
+            message: `Account control "${action}" ${response.ok ? "applied" : "rejected"}`,
+            payload: JSON.stringify({
+              action,
+              ok: response.ok,
+              http_status: response.status,
+              source_ip: request.headers.get("cf-connecting-ip") ?? null
+            }),
+            created_at: now()
+          });
+        } catch (auditError) {
+          console.error(
+            "CONTROL_AUDIT_FAILURE",
+            auditError instanceof Error ? auditError.message : String(auditError)
+          );
+        }
+
+        return response;
       }
 
       // =====================================================

@@ -83,14 +83,16 @@ not enabled: trailing stops, modification, and closing are deferred.
 
 Before any activation:
 
-1. Apply `postgres/003_executor.sql` to Aiven PostgreSQL.
+1. Apply `postgres/003_executor.sql` and `postgres/004_executor_hardening.sql`
+   to Aiven PostgreSQL.
 2. Set the Worker secret `EXECUTOR_API_KEY` and the same value in the bridge's
    local `.env.windows`; it is separate from `WARROOM_API_KEY`.
 3. Keep `PAPER_MODE=true` and verify the VPS is connected to the intended demo
    account.
 4. The account coordinator starts paused. Use the authenticated
    `/api/v1/control/resume` route to clear the pause. A latched kill switch
-   continues to block execution.
+   blocks execution and makes `/resume` return 409 until it is cleared with
+   `/api/v1/control/reset-kill` (which leaves the account paused).
 5. To explicitly arm demo orders later, set both Worker `TRADING_ENABLED=true`
    and bridge `MT5_TRADING_ENABLED=true`. Either gate being false prevents
    order dispatch.
