@@ -200,6 +200,29 @@ export async function sizeEligibleSignals(
         }>()
       ])
     : [{ results: [] }, { results: [] }];
+  const signalIds = eligibleRiskRows.map(row => row.signal_id);
+  const featureRows = signalIds.length
+    ? (await env.DB.prepare(`
+        SELECT signal_id, features_json
+        FROM scanner_results
+        WHERE signal_id IN (${signalIds.map(() => "?").join(",")})
+      `).bind(...signalIds).all<{
+        signal_id: string;
+        features_json: string;
+      }>()).results
+    : [];
+  const atrBySignal = new Map<string, number | null>();
+  for (const row of featureRows) {
+    try {
+      const features = JSON.parse(row.features_json) as { atr14?: unknown };
+      atrBySignal.set(
+        row.signal_id,
+        typeof features.atr14 === "number" ? features.atr14 : null
+      );
+    } catch {
+      atrBySignal.set(row.signal_id, null);
+    }
+  }
   const quoteBySymbol = new Map(quoteRows.results.map(row => [row.symbol, row]));
   const inputBySymbol = new Map(inputRows.results.map(row => [row.symbol, row]));
 
@@ -237,6 +260,7 @@ export async function sizeEligibleSignals(
       staleSeconds: config.staleSeconds,
       maxCandleGapSeconds: config.maxCandleGapSeconds,
       riskPct: config.riskPct,
+      signalAtr: atrBySignal.get(riskRow.signal_id) ?? null,
       paperMode: env.PAPER_MODE === "true",
       tradingEnabled: env.TRADING_ENABLED === "true",
       risk: {
@@ -266,7 +290,7 @@ export async function sizeEligibleSignals(
     "SIZER",
     new Date(nowMs).toISOString(),
     STRATEGY,
-    `${STRATEGY} v${STRATEGY_VERSION}: M1 ATR(14), stop 2x ATR, TP ${TAKE_PROFIT_R_MULTIPLE}R, max ${MAX_ALLOWED_RISK_PCT}% equity risk; sizing only, Executor separately gated`
+    `${STRATEGY} v${STRATEGY_VERSION}: ATR(14) (M5 for M5 signals, otherwise M1), stop 2x ATR, TP ${TAKE_PROFIT_R_MULTIPLE}R, max ${MAX_ALLOWED_RISK_PCT}% equity risk; sizing only, Executor separately gated`
   );
   if (statusUpdate) {
     await env.DB.prepare(statusUpdate.sql)

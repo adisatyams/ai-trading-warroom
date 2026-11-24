@@ -116,6 +116,41 @@ test("sizes a BUY from a 2x ATR stop within the 0.25% equity risk budget", () =>
   assert.equal(result.execution_enabled, false);
 });
 
+test("M5 signals size the stop from the scanner's M5 ATR instead of the M1 ATR", () => {
+  const result = sizePosition(
+    candidate({ timeframe: "M5" }),
+    input({ signalAtr: 3 })
+  );
+  assert.equal(result.decision, "SIZED_FOR_PAPER_REVIEW");
+  assert.equal(result.metrics.atr_source, "M5");
+  assert.equal(result.metrics.atr14_signal, 3);
+  assert.equal(result.metrics.atr14_m1, 1);
+  assert.ok(Math.abs(result.metrics.stop_loss_price! - (100.1 - 6)) < 1e-10);
+  assert.ok(Math.abs(result.metrics.take_profit_price! - (100.1 + 12)) < 1e-10);
+  assert.ok(result.metrics.estimated_risk_pct! <= 0.25);
+});
+
+test("M5 signals are rejected when the M5 ATR is unavailable", () => {
+  for (const signalAtr of [null, undefined, 0, Number.NaN]) {
+    const result = sizePosition(
+      candidate({ timeframe: "M5" }),
+      input({ signalAtr })
+    );
+    assert.equal(result.decision, "REJECTED");
+    assert.match(result.reasons.join(" "), /M5 ATR/);
+    assert.equal(result.metrics.volume, null);
+  }
+});
+
+test("non-M5 signals ignore the signal ATR and keep the M1 basis", () => {
+  const result = sizePosition(
+    candidate({ timeframe: "M15" }),
+    input({ signalAtr: 50 })
+  );
+  assert.equal(result.metrics.atr_source, "M1");
+  assert.ok(Math.abs(result.metrics.stop_loss_price! - 98.1) < 1e-10);
+});
+
 test("uses bid and an upward stop for SELL signals", () => {
   const result = sizePosition(
     candidate({ state: "SELL" }),

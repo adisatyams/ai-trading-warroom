@@ -121,7 +121,7 @@ It produces a separate result for each visible MT5 symbol and
 M5/M15/H1/H4 timeframe from completed candles, using EMA(20/50/200),
 MACD(12/26/9), RSI(14), ATR(14), and Bollinger Bands(20, 2). The rule score is
 weighted 25/25/15/20/15 with a 70-point candidate threshold; it is a heuristic,
-not a probability of profit. Hypothetical SL uses 2x M1 ATR(14) and TP is 2R.
+not a probability of profit. Hypothetical SL uses 2x ATR(14) (the M5 ATR for M5 signals, the M1 ATR for other timeframes) and TP is 2R.
 The bridge discovers all instruments visible in MT5 Market Watch and chunks its
 market, candle, and sizing payloads to the Worker limits. Scanner signals alone
 never send orders. The Executor requires a fresh demo heartbeat, passing Risk
@@ -139,6 +139,14 @@ account paused. Every pause/resume/kill/reset-kill is written to `system_events`
 `npx wrangler deploy --var TRADING_ENABLED:false`.
 Tick observations are
 retained for 48 hours and scan results for 14 days (pruned by the cron trigger).
+
+## Execution rule (M5 with H1/H4 trend filter)
+The Executor only creates intents from **M5** signals (score >= 70). A BUY needs
+the latest H1 and H4 EMA trend to be up (EMA20 > EMA50 > EMA200); a SELL needs both
+down. Missing or mixed H1/H4 data blocks the trade (`trend_blocked` in the
+executor run log). M15, H1 and H4 signals are still scanned but never executed.
+For M5 signals the Position Sizer places the stop at 2x the M5 ATR(14) with a 2R
+take profit and still caps risk at 0.25% of equity; this is not backtested.
 
 ## Resolving UNCERTAIN intents
 An intent becomes `UNCERTAIN` when the broker outcome is unknown (no ack, or the

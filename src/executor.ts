@@ -8,6 +8,45 @@ const TIMEFRAME_PRIORITY: Record<ScannerTimeframe, number> = {
   M5: 3
 };
 
+/** Only signals on this timeframe are executed. M15, H1 and H4 are not traded. */
+export const EXECUTION_TIMEFRAME: ScannerTimeframe = "M5";
+/** Higher timeframes whose EMA trend must agree with the execution signal. */
+export const TREND_TIMEFRAMES: ScannerTimeframe[] = ["H1", "H4"];
+
+type TrendFeatures = {
+  ema20?: number | null;
+  ema50?: number | null;
+  ema200?: number | null;
+} | null | undefined;
+
+/** EMA20 > EMA50 > EMA200 is an uptrend, the reverse a downtrend. */
+export function emaTrend(features: TrendFeatures): "UP" | "DOWN" | "NONE" {
+  if (!features) return "NONE";
+  const { ema20, ema50, ema200 } = features;
+  if (
+    typeof ema20 !== "number" || typeof ema50 !== "number" ||
+    typeof ema200 !== "number" ||
+    !Number.isFinite(ema20) || !Number.isFinite(ema50) ||
+    !Number.isFinite(ema200)
+  ) {
+    return "NONE";
+  }
+  if (ema20 > ema50 && ema50 > ema200) return "UP";
+  if (ema20 < ema50 && ema50 < ema200) return "DOWN";
+  return "NONE";
+}
+
+/** True only when every higher timeframe trend matches the trade direction. */
+export function trendAligned(
+  direction: "BUY" | "SELL",
+  higher: Partial<Record<ScannerTimeframe, TrendFeatures>>
+): boolean {
+  const wanted = direction === "BUY" ? "UP" : "DOWN";
+  return TREND_TIMEFRAMES.every(
+    timeframe => emaTrend(higher[timeframe]) === wanted
+  );
+}
+
 const ACTIVE_INTENT_STATUSES = [
   "PENDING",
   "DISPATCHED",
@@ -162,6 +201,7 @@ export async function enqueueEligibleTrades(
   reason?: string;
   evaluated: number;
   enqueued: number;
+  trend_blocked?: number;
 }> {
   if (env.TRADING_ENABLED !== "true" || env.PAPER_MODE !== "true") {
     return { locked: true, evaluated: 0, enqueued: 0 };
@@ -216,7 +256,7 @@ export async function enqueueEligibleTrades(
       SELECT symbol, timeframe, MAX(as_of) AS latest_as_of
       FROM scanner_results
       WHERE symbol IN (${symbolFilter})
-        AND timeframe IN ('M5', 'M15', 'H1', 'H4')
+        AND timeframe = 'M5'
       GROUP BY symbol, timeframe
     ) newest
       ON newest.symbol = s.symbol
@@ -242,7 +282,51 @@ export async function enqueueEligibleTrades(
     isFresh(row.risk_checked_at, nowMs, staleSeconds) &&
     isFresh(row.sizing_checked_at, nowMs, staleSeconds)
   );
-  const bestRows = chooseTopSignalPerSymbol(freshRows);
+
+  // Execute on M5 only, and only when the latest H1 and H4 EMA trends agree
+  // with the M5 direction.
+  const trendBySymbol = new Map<
+    string,
+    Partial<Record<ScannerTimeframe, TrendFeatures>>
+  >();
+  const candidateSymbols = [...new Set(freshRows.map(row => row.symbol))];
+  if (candidateSymbols.length) {
+    const trendRows = await env.DB.prepare(`
+      SELECT s.symbol, s.timeframe, s.features_json
+      FROM scanner_results s
+      JOIN (
+        SELECT symbol, timeframe, MAX(as_of) AS latest_as_of
+        FROM scanner_results
+        WHERE symbol IN (${candidateSymbols.map(() => "?").join(",")})
+          AND timeframe IN ('H1', 'H4')
+        GROUP BY symbol, timeframe
+      ) newest
+        ON newest.symbol = s.symbol
+        AND newest.timeframe = s.timeframe
+        AND newest.latest_as_of = s.as_of
+    `).bind(...candidateSymbols).all<{
+      symbol: string;
+      timeframe: ScannerTimeframe;
+      features_json: string;
+    }>();
+    for (const row of trendRows.results) {
+      let features: TrendFeatures = null;
+      try {
+        features = JSON.parse(row.features_json) as TrendFeatures;
+      } catch {
+        features = null;
+      }
+      const current = trendBySymbol.get(row.symbol) ?? {};
+      current[row.timeframe] = features;
+      trendBySymbol.set(row.symbol, current);
+    }
+  }
+  const alignedRows = freshRows.filter(row =>
+    row.timeframe === EXECUTION_TIMEFRAME &&
+    trendAligned(row.state, trendBySymbol.get(row.symbol) ?? {})
+  );
+  const trendBlocked = freshRows.length - alignedRows.length;
+  const bestRows = chooseTopSignalPerSymbol(alignedRows);
 
   let enqueued = 0;
   for (const row of bestRows) {
@@ -331,7 +415,12 @@ export async function enqueueEligibleTrades(
     }
   }
 
-  return { locked: false, evaluated: bestRows.length, enqueued };
+  return {
+    locked: false,
+    evaluated: bestRows.length,
+    enqueued,
+    trend_blocked: trendBlocked
+  };
 }
 
 export async function claimTradeIntents(

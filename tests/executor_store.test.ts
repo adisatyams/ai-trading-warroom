@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   acknowledgeTradeIntent,
   claimTradeIntents,
+  enqueueEligibleTrades,
   resolveUncertainIntent,
   validResolveRequest
 } from "../src/executor.ts";
@@ -81,6 +82,35 @@ function setup() {
       status TEXT NOT NULL,
       opened_at TEXT,
       closed_at TEXT
+    );
+    CREATE TABLE scanner_results (
+      signal_id TEXT PRIMARY KEY,
+      symbol TEXT NOT NULL,
+      timeframe TEXT NOT NULL,
+      strategy TEXT NOT NULL,
+      strategy_version TEXT NOT NULL,
+      state TEXT NOT NULL,
+      score REAL,
+      as_of TEXT,
+      features_json TEXT NOT NULL
+    );
+    CREATE TABLE risk_check_results (
+      signal_id TEXT PRIMARY KEY,
+      decision TEXT NOT NULL,
+      checked_at TEXT NOT NULL,
+      metrics_json TEXT NOT NULL
+    );
+    CREATE TABLE position_sizing_results (
+      signal_id TEXT PRIMARY KEY,
+      decision TEXT NOT NULL,
+      checked_at TEXT NOT NULL,
+      result_json TEXT NOT NULL
+    );
+    CREATE TABLE bridge_heartbeats (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      connected INTEGER NOT NULL,
+      trade_mode INTEGER NOT NULL,
+      received_at TEXT NOT NULL
     );
     CREATE TABLE system_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -279,4 +309,102 @@ test("resolve requests are validated", () => {
   assert.equal(validResolveRequest({
     intent_id: "a", resolution: "NO_FILL", note: "x".repeat(501)
   }), false);
+});
+
+// --- M5 execution with H1/H4 EMA trend filter -------------------------------
+
+const UP = { ema20: 3, ema50: 2, ema200: 1 };
+const DOWN = { ema20: 1, ema50: 2, ema200: 3 };
+const FLAT = { ema20: 2, ema50: 1, ema200: 3 };
+
+function coordinatorStub() {
+  return {
+    idFromName: () => "id",
+    get: () => ({
+      fetch: async () =>
+        new Response(JSON.stringify({ paused: false, kill_switch: false }))
+    })
+  };
+}
+
+function seedSignal(
+  raw: any,
+  symbol: string,
+  timeframe: string,
+  state: string,
+  features: object,
+  opts: { score?: number; asOf?: string; eligible?: boolean } = {}
+) {
+  const id = `${symbol}:${timeframe}:${opts.asOf ?? "t1"}`;
+  const now = new Date().toISOString();
+  raw.prepare(`
+    INSERT INTO scanner_results
+      (signal_id, symbol, timeframe, strategy, strategy_version, state, score, as_of, features_json)
+    VALUES (?, ?, ?, 'MULTI_TIMEFRAME_INDICATORS_V1', '1', ?, ?, ?, ?)
+  `).run(id, symbol, timeframe, state, opts.score ?? 80, opts.asOf ?? "t1", JSON.stringify(features));
+  if (opts.eligible) {
+    raw.prepare(
+      "INSERT INTO risk_check_results VALUES (?, 'ELIGIBLE_FOR_DEMO_EXECUTION', ?, ?)"
+    ).run(id, now, JSON.stringify({ max_spread_bps: 4 }));
+    const sell = state === "SELL";
+    raw.prepare(
+      "INSERT INTO position_sizing_results VALUES (?, 'SIZED_FOR_DEMO_EXECUTION', ?, ?)"
+    ).run(id, now, JSON.stringify({
+      direction: state,
+      metrics: {
+        entry_price: 100,
+        stop_loss_price: sell ? 102 : 98,
+        take_profit_price: sell ? 96 : 104,
+        volume: 0.1,
+        risk_budget: 25,
+        risk_pct_limit: 0.25
+      }
+    }));
+  }
+}
+
+test("only M5 signals whose H1 and H4 EMA trends agree become trade intents", skip, async () => {
+  const { raw, env } = setup();
+  env.ACCOUNT_COORDINATOR = coordinatorStub();
+  env.TRADING_ENABLED = "true";
+  raw.prepare(
+    "INSERT INTO bridge_heartbeats (connected, trade_mode, received_at) VALUES (1, 0, ?)"
+  ).run(new Date().toISOString());
+
+  // Aligned BUY: M5 BUY, H1 and H4 uptrend -> trade.
+  seedSignal(raw, "EURUSDm", "M5", "BUY", {}, { eligible: true });
+  seedSignal(raw, "EURUSDm", "H1", "WATCH", UP);
+  seedSignal(raw, "EURUSDm", "H4", "WATCH", UP);
+  // Aligned SELL: M5 SELL, H1 and H4 downtrend -> trade.
+  seedSignal(raw, "XAUUSDm", "M5", "SELL", {}, { eligible: true });
+  seedSignal(raw, "XAUUSDm", "H1", "WATCH", DOWN);
+  seedSignal(raw, "XAUUSDm", "H4", "WATCH", DOWN);
+  // M5 BUY against a downtrending H4 -> blocked.
+  seedSignal(raw, "GBPUSDm", "M5", "BUY", {}, { eligible: true });
+  seedSignal(raw, "GBPUSDm", "H1", "WATCH", UP);
+  seedSignal(raw, "GBPUSDm", "H4", "WATCH", DOWN);
+  // M5 BUY with a mixed (no-trend) H1 -> blocked.
+  seedSignal(raw, "USDJPYm", "M5", "BUY", {}, { eligible: true });
+  seedSignal(raw, "USDJPYm", "H1", "WATCH", FLAT);
+  seedSignal(raw, "USDJPYm", "H4", "WATCH", UP);
+  // Missing H4 data (e.g. stale candles) -> blocked.
+  seedSignal(raw, "AUDUSDm", "M5", "BUY", {}, { eligible: true });
+  seedSignal(raw, "AUDUSDm", "H1", "WATCH", UP);
+  // A perfectly aligned M15 signal is never executed.
+  seedSignal(raw, "USDCADm", "M15", "BUY", {}, { eligible: true });
+  seedSignal(raw, "USDCADm", "H1", "WATCH", UP);
+  seedSignal(raw, "USDCADm", "H4", "WATCH", UP);
+
+  const symbols = ["EURUSDm", "XAUUSDm", "GBPUSDm", "USDJPYm", "AUDUSDm", "USDCADm"];
+  const result = await enqueueEligibleTrades(env, symbols);
+  assert.equal(result.enqueued, 2);
+  assert.equal(result.trend_blocked, 3);
+
+  const intents = raw
+    .prepare("SELECT symbol, direction FROM trade_intents ORDER BY symbol")
+    .all() as Array<{ symbol: string; direction: string }>;
+  assert.deepEqual(
+    intents.map(row => `${row.symbol}:${row.direction}`),
+    ["EURUSDm:BUY", "XAUUSDm:SELL"]
+  );
 });

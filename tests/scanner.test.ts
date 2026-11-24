@@ -236,7 +236,7 @@ function indicatorCandles(
   });
 }
 
-test("multi-timeframe scanner scores an aligned breakout and emits M1 ATR 2R levels", () => {
+test("multi-timeframe scanner scores an aligned breakout; M5 levels use the M5 ATR (2x stop, 2R target)", () => {
   const candles = indicatorCandles(1);
   const nowMs = Date.parse(candles[candles.length - 1].time) + 60_000;
   const result = evaluateTimeframe(
@@ -258,9 +258,30 @@ test("multi-timeframe scanner scores an aligned breakout and emits M1 ATR 2R lev
   assert.equal(result.features.sell_score, 0);
   assert.ok(result.features.ema20! > result.features.ema50!);
   assert.ok(result.features.ema50! > result.features.ema200!);
+  const stopDistance = result.features.atr14! * 2;
+  assert.ok(Math.abs(result.stop_loss! - (result.entry! - stopDistance)) < 1e-6);
+  assert.ok(Math.abs(result.take_profit! - (result.entry! + stopDistance * 2)) < 1e-6);
+  assert.match(result.signal_id, /:M5:/);
+});
+
+test("non-M5 timeframes keep the M1 ATR stop basis", () => {
+  const candles = indicatorCandles(1);
+  const nowMs = Date.parse(candles[candles.length - 1].time) + 60_000;
+  const result = evaluateTimeframe(
+    "EURUSDm",
+    "H1",
+    candles,
+    {
+      bid: candles[candles.length - 1].close,
+      ask: candles[candles.length - 1].close + 0.0001,
+      received_at: new Date(nowMs - 5_000).toISOString()
+    },
+    nowMs,
+    0.1
+  );
+  assert.equal(result.state, "BUY");
   assert.ok(Math.abs(result.stop_loss! - (result.entry! - 0.2)) < 1e-8);
   assert.ok(Math.abs(result.take_profit! - (result.entry! + 0.4)) < 1e-8);
-  assert.match(result.signal_id, /:M5:/);
 });
 
 test("multi-timeframe scanner keeps sub-threshold momentum as WATCH", () => {

@@ -834,14 +834,16 @@ export function evaluateTimeframe(
 
   const direction = state === "BUY" ? 1 : -1;
   const entry = state === "BUY" ? quote.ask : quote.bid;
+  // M5 execution signals size their stop from the M5 ATR; others use M1 ATR.
+  const stopAtr = timeframe === "M5" ? atr : m1Atr;
   const stopDistance =
-    m1Atr && Number.isFinite(m1Atr) && m1Atr > 0 ? m1Atr * 2 : null;
+    stopAtr && Number.isFinite(stopAtr) && stopAtr > 0 ? stopAtr * 2 : null;
   const stopLoss =
     stopDistance === null ? null : entry - direction * stopDistance;
   const takeProfit =
     stopDistance === null ? null : entry + direction * stopDistance * 2;
   if (stopDistance === null) {
-    reasons.push("M1 ATR(14) unavailable; SL/TP are not calculated");
+    reasons.push(`${timeframe === "M5" ? "M5" : "M1"} ATR(14) unavailable; SL/TP are not calculated`);
   }
   return finish(state, reasons, {
     score,

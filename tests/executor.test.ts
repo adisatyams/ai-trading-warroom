@@ -1,7 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  EXECUTION_TIMEFRAME,
+  TREND_TIMEFRAMES,
   chooseTopSignalPerSymbol,
+  emaTrend,
+  trendAligned,
   validExecutorAck
 } from "../src/executor.ts";
 
@@ -48,4 +52,31 @@ test("rejects malformed or oversized executor acknowledgements", () => {
     status: "REJECTED",
     message: "x".repeat(501)
   }), false);
+});
+
+test("executes on M5 and checks the H1 and H4 trend", () => {
+  assert.equal(EXECUTION_TIMEFRAME, "M5");
+  assert.deepEqual(TREND_TIMEFRAMES, ["H1", "H4"]);
+});
+
+test("classifies EMA20/50/200 ordering as a trend", () => {
+  assert.equal(emaTrend({ ema20: 3, ema50: 2, ema200: 1 }), "UP");
+  assert.equal(emaTrend({ ema20: 1, ema50: 2, ema200: 3 }), "DOWN");
+  assert.equal(emaTrend({ ema20: 2, ema50: 3, ema200: 1 }), "NONE");
+  assert.equal(emaTrend({ ema20: 3, ema50: 3, ema200: 1 }), "NONE");
+  assert.equal(emaTrend({ ema20: null, ema50: 2, ema200: 1 }), "NONE");
+  assert.equal(emaTrend({}), "NONE");
+  assert.equal(emaTrend(null), "NONE");
+  assert.equal(emaTrend(undefined), "NONE");
+});
+
+test("trade direction must match both the H1 and the H4 trend", () => {
+  const up = { ema20: 3, ema50: 2, ema200: 1 };
+  const down = { ema20: 1, ema50: 2, ema200: 3 };
+  assert.equal(trendAligned("BUY", { H1: up, H4: up }), true);
+  assert.equal(trendAligned("SELL", { H1: down, H4: down }), true);
+  assert.equal(trendAligned("BUY", { H1: up, H4: down }), false);
+  assert.equal(trendAligned("SELL", { H1: up, H4: up }), false);
+  assert.equal(trendAligned("BUY", { H1: up }), false);
+  assert.equal(trendAligned("BUY", {}), false);
 });

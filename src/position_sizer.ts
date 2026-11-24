@@ -40,6 +40,11 @@ export interface PositionSizerInput {
   staleSeconds: number;
   maxCandleGapSeconds: number;
   riskPct: number;
+  /**
+   * ATR(14) of the signal's own timeframe (from the scanner). Used for the
+   * stop distance when the signal is an M5 execution signal.
+   */
+  signalAtr?: number | null;
   paperMode: boolean;
   tradingEnabled: boolean;
   risk: {
@@ -77,6 +82,8 @@ export interface PositionSizerResult {
   reasons: string[];
   metrics: {
     atr14_m1: number | null;
+    atr14_signal: number | null;
+    atr_source: "M5" | "M1" | null;
     entry_price: number | null;
     stop_loss_price: number | null;
     take_profit_price: number | null;
@@ -202,6 +209,8 @@ export function sizePosition(
   const reasons: string[] = [];
   const metrics: PositionSizerResult["metrics"] = {
     atr14_m1: null,
+    atr14_signal: null,
+    atr_source: null,
     entry_price: null,
     stop_loss_price: null,
     take_profit_price: null,
@@ -283,28 +292,48 @@ export function sizePosition(
   ) {
     reject("Fresh ATR and MT5 symbol contract data are required");
   } else {
-    const atr = calculateAtr14M1(
+    const m1 = calculateAtr14M1(
       snapshot.candles,
       input.nowMs,
       input.staleSeconds,
       input.maxCandleGapSeconds
     );
-    if (atr.atr === null) {
-      reject(atr.reason ?? "Unable to calculate ATR(14)");
-    } else {
-      metrics.atr14_m1 = atr.atr;
-      if (metrics.entry_price !== null) {
-        const stopDistance =
-          atr.atr * DEFAULT_POSITION_SIZER_CONFIG.stopAtrMultiple;
-        metrics.stop_loss_price =
-          direction === "BUY"
-            ? metrics.entry_price - stopDistance
-            : metrics.entry_price + stopDistance;
-        metrics.take_profit_price =
-          direction === "BUY"
-            ? metrics.entry_price + stopDistance * TAKE_PROFIT_R_MULTIPLE
-            : metrics.entry_price - stopDistance * TAKE_PROFIT_R_MULTIPLE;
+    metrics.atr14_m1 = m1.atr;
+    // M5 execution signals size their stop from the M5 ATR; every other
+    // timeframe keeps the original M1 ATR basis.
+    const usesSignalAtr = candidate.timeframe === "M5";
+    let stopAtr: number | null;
+    if (usesSignalAtr) {
+      const signalAtr = input.signalAtr;
+      stopAtr =
+        typeof signalAtr === "number" && Number.isFinite(signalAtr) && signalAtr > 0
+          ? signalAtr
+          : null;
+      metrics.atr14_signal = stopAtr;
+      if (stopAtr === null) {
+        reject("M5 ATR(14) from the scanner is unavailable");
+      } else {
+        metrics.atr_source = "M5";
       }
+    } else {
+      stopAtr = m1.atr;
+      if (stopAtr === null) {
+        reject(m1.reason ?? "Unable to calculate ATR(14)");
+      } else {
+        metrics.atr_source = "M1";
+      }
+    }
+    if (stopAtr !== null && metrics.entry_price !== null) {
+      const stopDistance =
+        stopAtr * DEFAULT_POSITION_SIZER_CONFIG.stopAtrMultiple;
+      metrics.stop_loss_price =
+        direction === "BUY"
+          ? metrics.entry_price - stopDistance
+          : metrics.entry_price + stopDistance;
+      metrics.take_profit_price =
+        direction === "BUY"
+          ? metrics.entry_price + stopDistance * TAKE_PROFIT_R_MULTIPLE
+          : metrics.entry_price - stopDistance * TAKE_PROFIT_R_MULTIPLE;
     }
 
     const spec = snapshot.spec;

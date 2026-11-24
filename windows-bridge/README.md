@@ -34,7 +34,7 @@ The bridge also submits 29 completed M1 candles and the broker's tick-value and
 volume and contract-size specifications for each visible symbol. Scanner uses EMA(20/50/200),
 MACD(12/26/9), RSI(14), ATR(14), and Bollinger Bands(20, 2). The rule score uses
 weights 25/25/15/20/15 and the candidate threshold is 70; it is a heuristic, not
-a probability of profit. Hypothetical SL is 2x M1 ATR(14), TP is 2R, and the
+a probability of profit. Hypothetical SL is 2x ATR(14) (M5 ATR for M5 signals, M1 ATR otherwise), TP is 2R, and the
 Sizer floors volume to the broker's volume step so estimated risk does not exceed
 0.25% of current equity. Missing, stale, invalid, or below-minimum inputs reject
 the size. The estimate does not include commissions or slippage.
@@ -72,9 +72,9 @@ The UTC-day baseline must be observed within two minutes after midnight UTC.
 If the bridge was not reporting equity then, daily loss and drawdown checks
 remain blocked for that UTC day rather than assuming a safe baseline.
 
-Position Sizer runs only after a fresh Risk Checker pass. The Executor selects
-the highest-scoring eligible timeframe per symbol and enforces one active intent
-per symbol. It uses a market order at the current broker quote with the Sizer's
+Position Sizer runs only after a fresh Risk Checker pass. The Executor trades
+M5 signals only, and only when the H1 and H4 EMA20/50/200 trends agree with the
+direction; it enforces one active intent per symbol. It uses a market order at the current broker quote with the Sizer's
 SL/TP and volume, rechecks the demo account, open positions, broker volume
 limits, expiry, and current-price risk budget, then records the broker result.
 Uncertain broker outcomes remain locked for manual reconciliation; commands are
