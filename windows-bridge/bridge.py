@@ -9,6 +9,7 @@ import httpx
 import MetaTrader5 as mt5
 from dotenv import load_dotenv
 from calendar_feed import read_calendar_snapshot
+from symbol_filter import parse_symbol_config, resolve_symbols
 
 load_dotenv(".env.windows")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -17,6 +18,8 @@ BASE = os.environ["WARROOM_API_URL"].rstrip("/")
 KEY = os.environ["WARROOM_API_KEY"]
 PATH = os.getenv("MT5_PATH", "")
 SYMBOLS = []
+# Base names from .env.windows (SYMBOLS=XAUUSD,EURUSD,...). Empty = every Market Watch symbol.
+CONFIGURED_SYMBOLS = parse_symbol_config(os.getenv("SYMBOLS", ""))
 SCANNER_TIMEFRAMES = {
     "M5": mt5.TIMEFRAME_M5,
     "M15": mt5.TIMEFRAME_M15,
@@ -452,6 +455,29 @@ def refresh_symbols():
     instruments = mt5.symbols_get()
     if instruments is None:
         raise RuntimeError(f"MT5 symbols_get failed: {mt5.last_error()}")
+
+    if CONFIGURED_SYMBOLS:
+        available = [str(i.name) for i in instruments if i.name]
+        resolved, missing = resolve_symbols(CONFIGURED_SYMBOLS, available)
+        if missing:
+            logging.warning(
+                "SYMBOLS entries not found at this broker: %s", ", ".join(missing)
+            )
+        selected = []
+        for name in resolved:
+            if mt5.symbol_select(name, True):
+                selected.append(name)
+            else:
+                logging.warning("Could not add %s to Market Watch: %s", name, mt5.last_error())
+        if not selected:
+            raise RuntimeError(
+                "None of the configured SYMBOLS are available: "
+                + ", ".join(CONFIGURED_SYMBOLS)
+            )
+        SYMBOLS[:] = sorted(selected)
+        logging.info("Configured instruments active (%d): %s", len(SYMBOLS), ", ".join(SYMBOLS))
+        return
+
     visible = sorted(
         str(instrument.name)
         for instrument in instruments
@@ -460,7 +486,11 @@ def refresh_symbols():
     if not visible:
         raise RuntimeError("MT5 Market Watch has no visible instruments")
     SYMBOLS[:] = visible
-    logging.info("Market Watch instruments loaded: %d", len(SYMBOLS))
+    logging.warning(
+        "SYMBOLS is not set: using ALL %d Market Watch instruments. "
+        "Set SYMBOLS in .env.windows to limit the load.",
+        len(SYMBOLS),
+    )
 
 
 class HeartbeatWorker:
