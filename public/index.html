@@ -27,7 +27,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;color:#b9c8da}
 <div class="grid">
 <section class="card"><h2>Latest Market Snapshot</h2><table><thead><tr><th>Symbol</th><th>Bid</th><th>Ask</th><th>Last update</th></tr></thead><tbody id="markets"></tbody></table></section>
 <section class="card"><h2>Control state</h2><p class="muted">Controls affect monitoring state only. They do not enable trading.</p>
-<button onclick="control('pause')">Pause</button><button onclick="control('resume')">Resume</button><button onclick="control('kill')">Kill switch</button><pre id="control">Loading…</pre></section>
+<button onclick="control('pause')">Pause</button><button onclick="control('resume')">Resume</button><button onclick="control('kill')">Kill switch</button><button onclick="control('reset-kill')">Reset kill switch</button><pre id="control">Loading…</pre></section>
 </div>
 <script>
 async function api(path,opts={}){const r=await fetch(path,opts);if(!r.ok)throw Error(path+' '+r.status);return r.json()}
@@ -117,6 +117,7 @@ async function refresh(){
  }catch(e){document.querySelector('#api').textContent='ERROR';console.error(e)}
 }
 async function control(action){
+ if((action==='kill'||action==='reset-kill')&&!confirm('Confirm account control action: '+action+'?'))return;
  const key=prompt('Enter WarRoom API key (admin action):');if(!key)return;
  const r=await fetch('/api/v1/control/'+action,{method:'POST',headers:{'x-api-key':key}});
  document.querySelector('#control').textContent=JSON.stringify(await r.json(),null,2);

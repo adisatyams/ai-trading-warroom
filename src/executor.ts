@@ -130,7 +130,8 @@ async function expirePendingIntents(env: Env, staleSeconds: number): Promise<voi
   const dispatched = await env.DB.prepare(`
     UPDATE trade_intents
     SET status = 'UNCERTAIN'
-    WHERE status = 'DISPATCHED' AND created_at < ?
+    WHERE status = 'DISPATCHED'
+      AND COALESCE(dispatched_at, created_at) < ?
   `).bind(cutoff).run();
   const expiredCount =
     (pending.meta.changes ?? 0) + (dispatched.meta.changes ?? 0);
@@ -412,10 +413,10 @@ export async function claimTradeIntents(
 
     const claimed = await env.DB.prepare(`
       UPDATE trade_intents
-      SET status = 'DISPATCHED'
+      SET status = 'DISPATCHED', dispatched_at = ?
       WHERE intent_id = ? AND status = 'PENDING'
       RETURNING intent_id, payload_json
-    `).bind(row.intent_id).first<{
+    `).bind(new Date().toISOString(), row.intent_id).first<{
       intent_id: string;
       payload_json: string;
     }>();
@@ -506,12 +507,25 @@ export async function acknowledgeTradeIntent(
   }>();
   if (!intent) return { accepted: false, duplicate: false };
 
+  let history: { trade_id: string; status: string } | null = null;
   if (intent.status !== "DISPATCHED") {
-    const history = await env.DB.prepare(`
+    history = await env.DB.prepare(`
       SELECT trade_id, status
       FROM trade_history
       WHERE trade_id = ?
     `).bind(ack.intent_id).first<{ trade_id: string; status: string }>();
+  }
+
+  // An intent that the expiry job already flipped to UNCERTAIN may still
+  // receive its real acknowledgement (the broker call can outlive the expiry
+  // window). Accept it so the order is recorded and the symbol is released or
+  // tracked correctly, instead of orphaning a live position.
+  const lateAck =
+    intent.status === "UNCERTAIN" &&
+    (!history || history.status === "UNCERTAIN") &&
+    !(history && ack.status === "UNCERTAIN");
+
+  if (intent.status !== "DISPATCHED" && !lateAck) {
     return {
       accepted: !!history &&
         (intent.status === ack.status ||
@@ -533,14 +547,20 @@ export async function acknowledgeTradeIntent(
     env.DB.prepare(`
       UPDATE trade_intents
       SET status = ?
-      WHERE intent_id = ? AND status = 'DISPATCHED'
+      WHERE intent_id = ? AND status IN ('DISPATCHED', 'UNCERTAIN')
     `).bind(status, ack.intent_id),
     env.DB.prepare(`
       INSERT INTO trade_history
         (trade_id, broker_ticket, symbol, direction, volume, entry_price,
          exit_price, pnl, status, opened_at, closed_at)
       VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL)
-      ON CONFLICT (trade_id) DO NOTHING
+      ON CONFLICT (trade_id) DO UPDATE SET
+        broker_ticket = EXCLUDED.broker_ticket,
+        volume = EXCLUDED.volume,
+        entry_price = EXCLUDED.entry_price,
+        status = EXCLUDED.status,
+        opened_at = EXCLUDED.opened_at
+      WHERE trade_history.status = 'UNCERTAIN'
     `).bind(
       ack.intent_id,
       ack.broker_ticket == null ? null : String(ack.broker_ticket),
@@ -559,14 +579,169 @@ export async function acknowledgeTradeIntent(
       level,
       `TRADE_${status}`,
       `Demo order ${status.toLowerCase()} for ${intent.symbol}`,
-      JSON.stringify(ack),
+      JSON.stringify(lateAck ? { ...ack, late_ack: true } : ack),
       new Date().toISOString()
     )
   ]);
   return { accepted: true, duplicate: false };
 }
 
+export interface ResolveRequest {
+  intent_id: string;
+  /** NO_FILL: the operator confirmed in MT5 that no order exists.
+   *  FILLED: the operator confirmed an open (or closed) position exists. */
+  resolution: "NO_FILL" | "FILLED";
+  broker_ticket?: string | number | null;
+  volume?: number | null;
+  entry_price?: number | null;
+  opened_at?: string | null;
+  note?: string | null;
+}
+
+export function validResolveRequest(value: unknown): value is ResolveRequest {
+  if (!value || typeof value !== "object") return false;
+  const body = value as Record<string, unknown>;
+  if (
+    typeof body.intent_id !== "string" ||
+    !body.intent_id ||
+    body.intent_id.length > 64 ||
+    (body.resolution !== "NO_FILL" && body.resolution !== "FILLED") ||
+    (body.note != null &&
+      (typeof body.note !== "string" || body.note.length > 500)) ||
+    (body.opened_at != null &&
+      (typeof body.opened_at !== "string" ||
+        !Number.isFinite(Date.parse(body.opened_at))))
+  ) {
+    return false;
+  }
+  if (body.resolution === "NO_FILL") return true;
+
+  const ticket = body.broker_ticket;
+  return (
+    (typeof ticket === "string" || typeof ticket === "number") &&
+    String(ticket).length > 0 &&
+    String(ticket).length <= 80 &&
+    (typeof ticket !== "number" || Number.isFinite(ticket)) &&
+    typeof body.volume === "number" &&
+    Number.isFinite(body.volume) &&
+    body.volume > 0 &&
+    typeof body.entry_price === "number" &&
+    Number.isFinite(body.entry_price) &&
+    body.entry_price > 0
+  );
+}
+
+/**
+ * Operator reconciliation for an UNCERTAIN intent. Without this an UNCERTAIN
+ * intent holds the one-active-intent-per-symbol lock forever.
+ */
+export async function resolveUncertainIntent(
+  env: Env,
+  request: ResolveRequest
+): Promise<{
+  resolved: boolean;
+  code?: "NOT_FOUND" | "NOT_UNCERTAIN";
+  reason?: string;
+  status?: string;
+}> {
+  const intent = await env.DB.prepare(`
+    SELECT intent_id, symbol, direction, status
+    FROM trade_intents
+    WHERE intent_id = ?
+  `).bind(request.intent_id).first<{
+    intent_id: string;
+    symbol: string;
+    direction: string;
+    status: string;
+  }>();
+  if (!intent) {
+    return { resolved: false, code: "NOT_FOUND", reason: "Unknown trade intent" };
+  }
+  if (intent.status !== "UNCERTAIN") {
+    return {
+      resolved: false,
+      code: "NOT_UNCERTAIN",
+      reason: `Intent is ${intent.status}; only UNCERTAIN intents can be resolved`
+    };
+  }
+
+  const nowIso = new Date().toISOString();
+  const filled = request.resolution === "FILLED";
+  const newStatus = filled ? "EXECUTED" : "REJECTED";
+  const statements = [
+    env.DB.prepare(`
+      UPDATE trade_intents
+      SET status = ?
+      WHERE intent_id = ? AND status = 'UNCERTAIN'
+    `).bind(newStatus, request.intent_id)
+  ];
+
+  if (filled) {
+    statements.push(env.DB.prepare(`
+      INSERT INTO trade_history
+        (trade_id, broker_ticket, symbol, direction, volume, entry_price,
+         exit_price, pnl, status, opened_at, closed_at)
+      VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 'EXECUTED', ?, NULL)
+      ON CONFLICT (trade_id) DO UPDATE SET
+        broker_ticket = EXCLUDED.broker_ticket,
+        volume = EXCLUDED.volume,
+        entry_price = EXCLUDED.entry_price,
+        status = EXCLUDED.status,
+        opened_at = EXCLUDED.opened_at
+      WHERE trade_history.status = 'UNCERTAIN'
+    `).bind(
+      request.intent_id,
+      String(request.broker_ticket),
+      intent.symbol,
+      intent.direction,
+      request.volume ?? null,
+      request.entry_price ?? null,
+      request.opened_at ?? nowIso
+    ));
+  } else {
+    statements.push(env.DB.prepare(`
+      UPDATE trade_history
+      SET status = 'REJECTED'
+      WHERE trade_id = ? AND status = 'UNCERTAIN'
+    `).bind(request.intent_id));
+  }
+
+  statements.push(env.DB.prepare(`
+    INSERT INTO system_events
+      (level, event_type, message, payload_json, created_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).bind(
+    "WARN",
+    "TRADE_INTENT_RESOLVED",
+    `Operator resolved UNCERTAIN intent for ${intent.symbol} as ${request.resolution}`,
+    JSON.stringify({
+      intent_id: request.intent_id,
+      resolution: request.resolution,
+      new_status: newStatus,
+      broker_ticket: request.broker_ticket ?? null,
+      note: request.note ?? null
+    }),
+    nowIso
+  ));
+
+  await env.DB.batch(statements);
+  return { resolved: true, status: newStatus };
+}
+
 export async function executorStatus(env: Env) {
+  const uncertain = await env.DB.prepare(`
+    SELECT intent_id, symbol, direction, created_at, dispatched_at
+    FROM trade_intents
+    WHERE status = 'UNCERTAIN'
+    ORDER BY created_at
+    LIMIT 20
+  `).all<{
+    intent_id: string;
+    symbol: string;
+    direction: string;
+    created_at: string;
+    dispatched_at: string | null;
+  }>();
   const statuses = await env.DB.prepare(`
     SELECT status, COUNT(*) AS count
     FROM trade_intents
@@ -612,6 +787,7 @@ export async function executorStatus(env: Env) {
       0
     ),
     intents: counts,
+    uncertain_intents: uncertain.results,
     position_management: {
       trailing_stop: false,
       modification: false,

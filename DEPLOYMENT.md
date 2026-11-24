@@ -55,8 +55,9 @@ This deployment starts with an empty Aiven database; D1 records are not copied.
 Apply `postgres/001_initial_schema.sql` using the Aiven console or `psql`.
 For an existing database already initialized with 001, apply
 `postgres/002_multi_timeframe_scanner.sql` and then
-`postgres/003_executor.sql`. Fresh databases should apply 001, 002, and 003 in
-order before deploying.
+`postgres/003_executor.sql` and then `postgres/004_executor_hardening.sql`
+(adds `trade_intents.dispatched_at`; apply it BEFORE deploying this version).
+Fresh databases should apply 001, 002, 003, and 004 in order before deploying.
 Keep the connection URL in a secure environment variable or password manager;
 never commit or print it.
 
@@ -126,11 +127,38 @@ market, candle, and sizing payloads to the Worker limits. Scanner signals alone
 never send orders. The Executor requires a fresh demo heartbeat, passing Risk
 Checker and Sizer results, an unpaused account, and both Worker
 `TRADING_ENABLED` and local `MT5_TRADING_ENABLED` set to `true`. The repository
-defaults remain `TRADING_ENABLED=false`, `PAPER_MODE=true`, and
-`MT5_TRADING_ENABLED=false`; do not change them until explicitly ready to arm a
-demo terminal. Before arming, use the authenticated `/api/v1/control/resume`
-route; a latched kill switch continues to block execution. Tick observations are
+Wrangler default is now `TRADING_ENABLED=true` (the Worker gate is open so the
+demo run can be observed), while `PAPER_MODE=true` and the bridge's
+`MT5_TRADING_ENABLED=false` remain; orders still require the bridge gate, an
+unpaused account and a demo-account check. Set `TRADING_ENABLED` back to
+`false` to lock the Worker side. Before arming, use the authenticated `/api/v1/control/resume`
+route; a latched kill switch blocks execution and `/resume` is refused (HTTP
+409) until it is cleared with `POST /api/v1/control/reset-kill`, which leaves the
+account paused. Every pause/resume/kill/reset-kill is written to `system_events`
+(`ACCOUNT_*`) and shows up in the Logger. To lock the Worker side again, use
+`npx wrangler deploy --var TRADING_ENABLED:false`.
+Tick observations are
 retained for 48 hours and scan results for 14 days (pruned by the cron trigger).
+
+## Resolving UNCERTAIN intents
+An intent becomes `UNCERTAIN` when the broker outcome is unknown (no ack, or the
+bridge reported it). It keeps the symbol locked. A late real acknowledgement from
+the bridge is still accepted and upgrades the record. Otherwise reconcile it in
+MT5 and call (authenticated with `WARROOM_API_KEY`):
+
+```bash
+# No order exists in MT5: releases the symbol
+curl -X POST "$URL/api/v1/executor/intents/resolve" -H "x-api-key: $KEY" \
+  -H "content-type: application/json" \
+  -d '{"intent_id":"<id>","resolution":"NO_FILL","note":"checked MT5 history"}'
+
+# An order/position exists: records it (the symbol stays locked until it closes)
+curl -X POST "$URL/api/v1/executor/intents/resolve" -H "x-api-key: $KEY" \
+  -H "content-type: application/json" \
+  -d '{"intent_id":"<id>","resolution":"FILLED","broker_ticket":"123456","volume":0.1,"entry_price":1.1001}'
+```
+Pending UNCERTAIN intents are listed in `GET /api/v1/executor/status`
+(`uncertain_intents`). Each resolution is written to `system_events`.
 
 ## Notes on the architecture
 - Queue delivery can retry. Consumers must be idempotent; never treat a queue delivery as proof that a broker order has executed.

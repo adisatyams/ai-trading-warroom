@@ -18,10 +18,15 @@ Worker and this bridge are explicitly enabled.
    or restart `bridge.py`. The bridge sends the calendar and open-position
    snapshots every `RISK_SNAPSHOT_SECONDS` (default 60).
 
-The bridge discovers every instrument currently visible in MT5 Market Watch,
-including broker suffixes such as `m`, and refreshes that list once per risk
-snapshot. Make the intended instruments visible in Market Watch before starting
-the bridge. It sends completed M5, M15, H1, and H4 candles for scanner analysis;
+Set `SYMBOLS` in `.env.windows` (for example
+`SYMBOLS=XAUUSD,EURUSD,GBPUSD,USDJPY`) to limit the bridge to those instruments.
+Base names are matched to the broker's names automatically, so `EURUSD` becomes
+`EURUSDm` on Exness (an exact match wins; otherwise a suffix of up to 3
+characters). Each match is added to Market Watch, entries the broker does not
+have are logged as warnings, and the list is refreshed once per risk snapshot.
+Keep it to 10-40 liquid symbols: scanning hundreds of symbols overloads the
+Worker's queue consumer and makes every quote stale. If `SYMBOLS` is empty, the
+bridge falls back to every Market Watch instrument and logs a warning. It sends completed M5, M15, H1, and H4 candles for scanner analysis;
 220 bars are requested for each timeframe and the bridge chunks requests to
 stay within the API limits.
 
@@ -77,22 +82,25 @@ never automatically retried after dispatch.
 
 ## Executor activation and API
 
-The repository defaults remain locked: `TRADING_ENABLED=false` in Wrangler and
+The Worker gate is open by default (`TRADING_ENABLED=true` in Wrangler) for the
+demo observation run, but the bridge stays locked with
 `MT5_TRADING_ENABLED=false` in `.env.windows.example`. Position management is
 not enabled: trailing stops, modification, and closing are deferred.
 
 Before any activation:
 
-1. Apply `postgres/003_executor.sql` to Aiven PostgreSQL.
+1. Apply `postgres/003_executor.sql` and `postgres/004_executor_hardening.sql`
+   to Aiven PostgreSQL.
 2. Set the Worker secret `EXECUTOR_API_KEY` and the same value in the bridge's
    local `.env.windows`; it is separate from `WARROOM_API_KEY`.
 3. Keep `PAPER_MODE=true` and verify the VPS is connected to the intended demo
    account.
 4. The account coordinator starts paused. Use the authenticated
    `/api/v1/control/resume` route to clear the pause. A latched kill switch
-   continues to block execution.
-5. To explicitly arm demo orders later, set both Worker `TRADING_ENABLED=true`
-   and bridge `MT5_TRADING_ENABLED=true`. Either gate being false prevents
+   blocks execution and makes `/resume` return 409 until it is cleared with
+   `/api/v1/control/reset-kill` (which leaves the account paused).
+5. To arm demo orders, Worker `TRADING_ENABLED=true` (already the default) and
+   bridge `MT5_TRADING_ENABLED=true` in `.env.windows` must both be set. Either gate being false prevents
    order dispatch.
 
 - `GET /api/v1/executor/status` reports the Worker gate, demo heartbeat, and
